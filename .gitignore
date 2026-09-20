@@ -24,6 +24,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
 *.egg-info/
@@ -39,9 +44,18 @@ ENV/
 .vscode/
 .idea/
 *.swp
+*~
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── Local backup/editor snapshots ────────────────────────────────────────────
+*.backup
+*.save
+*.bak
+*.before_router
+*.prev.*
+*.tmp
 
 # ── Runtime output ────────────────────────────────────────────────────────────
 *.log
