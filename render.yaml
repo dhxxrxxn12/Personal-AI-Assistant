@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: jarvis-cloud
+    runtime: python
+    region: singapore
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn cloud.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ready
+    autoDeployTrigger: commit
+    disk:
+      name: jarvis-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: JARVIS_ENV
+        value: production
+      - key: JARVIS_DATA_DIR
+        value: /var/data
+      - key: JARVIS_AGENT_ID
+        value: mac-main
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: JARVIS_ADMIN_TOKEN
+        sync: false
+      - key: JARVIS_AGENT_TOKEN
+        sync: false

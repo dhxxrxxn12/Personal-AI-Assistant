@@ -1,0 +1,839 @@
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from core.action_loader import discover_actions
+from automation.autonomous_engine import AutonomousEngine
+from automation.autonomous_planner import AutonomousPlanner
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+app = FastAPI(
+    title="JARVIS Cloud",
+    version="1.0.0",
+)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+ACTION_DIR = BASE_DIR / "actions"
+CONFIG_FILE = BASE_DIR / "config" / "api_keys.json"
+TASK_FILE = BASE_DIR / "cloud" / "tasks.json"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def current_time() -> str:
+    return datetime.now().isoformat()
+
+
+# ============================================================
+# LOAD API CONFIG
+# ============================================================
+
+if not CONFIG_FILE.exists():
+    raise RuntimeError(
+        f"Config file not found: {CONFIG_FILE}"
+    )
+
+with CONFIG_FILE.open(
+    "r",
+    encoding="utf-8",
+) as f:
+    config = json.load(f)
+
+gemini_api_key = config.get(
+    "gemini_api_key"
+)
+
+if not gemini_api_key:
+    raise RuntimeError(
+        "gemini_api_key not found in config/api_keys.json"
+    )
+
+
+# ============================================================
+# TASK STORAGE
+# ============================================================
+
+tasks: Dict[str, Dict[str, Any]] = {}
+
+
+def load_tasks() -> None:
+    global tasks
+
+    TASK_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if not TASK_FILE.exists():
+        tasks = {}
+        return
+
+    try:
+        with TASK_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            tasks = data
+        else:
+            tasks = {}
+
+    except Exception as exc:
+        print(
+            f"[JARVIS Cloud] "
+            f"Could not load tasks: {exc}"
+        )
+
+        tasks = {}
+
+
+def save_tasks() -> None:
+    TASK_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_file = TASK_FILE.with_suffix(
+        ".tmp"
+    )
+
+    try:
+        with temporary_file.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                tasks,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        temporary_file.replace(
+            TASK_FILE
+        )
+
+    except Exception as exc:
+        print(
+            f"[JARVIS Cloud] "
+            f"Could not save tasks: {exc}"
+        )
+
+
+load_tasks()
+
+
+# ============================================================
+# JARVIS BRAIN
+# ============================================================
+
+action_registry = discover_actions(
+    ACTION_DIR
+)
+
+print(
+    f"[JARVIS] Loaded "
+    f"{len(action_registry.names())} actions"
+)
+
+
+engine = AutonomousEngine(
+    action_registry=action_registry,
+    context={
+        "platform": "cloud",
+    },
+    logger=lambda msg: print(
+        f"[Autonomous] {msg}"
+    ),
+)
+
+
+planner = AutonomousPlanner(
+    action_registry=action_registry,
+    learning_memory=engine.learning,
+    api_key=gemini_api_key,
+    logger=lambda msg: print(
+        f"[Planner] {msg}"
+    ),
+)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+class TaskRequest(BaseModel):
+
+    goal: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+    )
+
+    device: str = Field(
+        default="cloud",
+        min_length=1,
+        max_length=100,
+    )
+
+
+class TaskClaimRequest(BaseModel):
+
+    device: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+
+
+class TaskResultRequest(BaseModel):
+
+    status: str = Field(
+        default="completed",
+        min_length=1,
+        max_length=50,
+    )
+
+    result: Any = None
+
+    error: Optional[str] = None
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "name": "JARVIS Cloud",
+        "version": "1.0.0",
+        "status": "online",
+        "actions": len(
+            action_registry.names()
+        ),
+        "tasks": len(tasks),
+        "storage": "persistent",
+        "time": current_time(),
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "healthy",
+        "actions": len(
+            action_registry.names()
+        ),
+        "tasks": len(tasks),
+        "storage": "persistent",
+    }
+
+
+# ============================================================
+# TASK STATUS SUMMARY
+# ============================================================
+
+@app.get("/tasks/status/summary")
+async def task_summary():
+
+    summary: Dict[str, int] = {}
+
+    for task in tasks.values():
+
+        status = task.get(
+            "status",
+            "unknown",
+        )
+
+        summary[status] = (
+            summary.get(
+                status,
+                0,
+            )
+            + 1
+        )
+
+    return {
+        "total": len(tasks),
+        "statuses": summary,
+    }
+
+
+# ============================================================
+# LIST TASKS
+# ============================================================
+
+@app.get("/tasks")
+async def list_tasks():
+
+    return list(
+        tasks.values()
+    )
+
+
+# ============================================================
+# CREATE TASK
+# ============================================================
+
+@app.post("/tasks")
+async def create_task(
+    request: TaskRequest,
+):
+
+    task_id = str(
+        uuid.uuid4()
+    )
+
+    print()
+    print("=" * 60)
+
+    print(
+        f"[JARVIS Cloud] "
+        f"New task: {request.goal}"
+    )
+
+    print(
+        f"[JARVIS Cloud] "
+        f"Target device: {request.device}"
+    )
+
+    print("=" * 60)
+
+    task = {
+
+        "id": task_id,
+
+        "goal": request.goal,
+
+        "device": request.device,
+
+        "status": "planning",
+
+        "plan": None,
+
+        "result": None,
+
+        "error": None,
+
+        "created_at": current_time(),
+
+        "planned_at": None,
+
+        "claimed_at": None,
+
+        "completed_at": None,
+
+        "claimed_by": None,
+    }
+
+    tasks[task_id] = task
+
+    save_tasks()
+
+    try:
+
+        plan = planner.plan(
+            request.goal
+        )
+
+        if hasattr(
+            plan,
+            "to_dict",
+        ):
+
+            plan_data = plan.to_dict()
+
+        elif hasattr(
+            plan,
+            "__dict__",
+        ):
+
+            plan_data = dict(
+                plan.__dict__
+            )
+
+        else:
+
+            plan_data = str(
+                plan
+            )
+
+        task["plan"] = plan_data
+
+        if request.device == "cloud":
+
+            task["status"] = "planned"
+
+        else:
+
+            task["status"] = "queued"
+
+        task["planned_at"] = (
+            current_time()
+        )
+
+        save_tasks()
+
+        print(
+            "[JARVIS Cloud] "
+            "Plan generated successfully."
+        )
+
+        return task
+
+    except Exception as exc:
+
+        task["status"] = (
+            "planning_failed"
+        )
+
+        task["error"] = str(
+            exc
+        )
+
+        save_tasks()
+
+        print(
+            f"[JARVIS Cloud] "
+            f"Planning failed: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
+# ============================================================
+# DEVICE QUEUE
+# ============================================================
+
+@app.get(
+    "/devices/{device}/tasks"
+)
+async def get_device_tasks(
+    device: str,
+):
+
+    return [
+
+        task
+
+        for task in tasks.values()
+
+        if (
+
+            task.get(
+                "device"
+            )
+            == device
+
+            and
+
+            task.get(
+                "status"
+            )
+            == "queued"
+
+        )
+
+    ]
+
+
+# ============================================================
+# CLAIM TASK
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/claim"
+)
+async def claim_task(
+    task_id: str,
+    request: TaskClaimRequest,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    if task.get(
+        "status"
+    ) != "queued":
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task cannot be claimed. "
+                f"Current status: "
+                f"{task.get('status')}"
+            ),
+        )
+
+    if task.get(
+        "device"
+    ) != request.device:
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task belongs to "
+                f"'{task.get('device')}'."
+            ),
+        )
+
+    task["status"] = "running"
+
+    task["claimed_by"] = (
+        request.device
+    )
+
+    task["claimed_at"] = (
+        current_time()
+    )
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# GET SINGLE TASK
+# ============================================================
+
+@app.get(
+    "/tasks/{task_id}"
+)
+async def get_task(
+    task_id: str,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    return task
+
+
+# ============================================================
+# UPDATE RESULT + LEARNING
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/result"
+)
+async def update_task_result(
+    task_id: str,
+    request: TaskResultRequest,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    allowed_statuses = {
+
+        "completed",
+
+        "failed",
+
+        "cancelled",
+
+    }
+
+    if request.status not in allowed_statuses:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid status. "
+                f"Allowed: "
+                f"{sorted(allowed_statuses)}"
+            ),
+        )
+
+    # ----------------------------------------------------------
+    # UPDATE RESULT
+    # ----------------------------------------------------------
+
+    task["status"] = (
+        request.status
+    )
+
+    task["result"] = (
+        request.result
+    )
+
+    task["error"] = (
+        request.error
+    )
+
+    task["completed_at"] = (
+        current_time()
+    )
+
+    # ----------------------------------------------------------
+    # LEARN SUCCESSFUL WORKFLOW
+    # ----------------------------------------------------------
+
+    if request.status == "completed":
+
+        plan = task.get(
+            "plan"
+        ) or {}
+
+        planned_steps = (
+            plan.get(
+                "tasks"
+            )
+            or []
+        )
+
+        if planned_steps:
+
+            try:
+
+                from automation.autonomous_engine import Task
+
+                learned_tasks = []
+
+                for step in planned_steps:
+
+                    if not isinstance(
+                        step,
+                        dict,
+                    ):
+                        continue
+
+                    action = step.get(
+                        "action"
+                    )
+
+                    if not action:
+                        continue
+
+                    parameters = step.get(
+                        "parameters",
+                        {},
+                    )
+
+                    description = step.get(
+                        "description",
+                        "",
+                    )
+
+                    learned_tasks.append(
+                        Task(
+                            action=action,
+                            parameters=parameters,
+                            description=description,
+                        )
+                    )
+
+                if learned_tasks:
+
+                    learned = (
+                        engine.learn_workflow(
+                            name=(
+                                "Cloud: "
+                                f"{task['goal'][:60]}"
+                            ),
+                            goal=task["goal"],
+                            tasks=learned_tasks,
+                        )
+                    )
+
+                    if learned:
+
+                        print(
+                            "[JARVIS Cloud] "
+                            "🧠 Learned workflow: "
+                            f"{task['goal']}"
+                        )
+
+                    else:
+
+                        print(
+                            "[JARVIS Cloud] "
+                            "⚠️ Workflow was "
+                            "not learned."
+                        )
+
+            except Exception as exc:
+
+                print(
+                    "[JARVIS Cloud] "
+                    f"⚠️ Learning failed: {exc}"
+                )
+
+    # ----------------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------------
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# CANCEL TASK
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/cancel"
+)
+async def cancel_task(
+    task_id: str,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    if task.get(
+        "status"
+    ) in {
+
+        "completed",
+
+        "failed",
+
+        "cancelled",
+
+    }:
+
+        raise HTTPException(
+            status_code=409,
+            detail="Task is already finished.",
+        )
+
+    task["status"] = (
+        "cancelled"
+    )
+
+    task["completed_at"] = (
+        current_time()
+    )
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# MEMORY STATUS
+# ============================================================
+
+@app.get(
+    "/memory/status"
+)
+async def memory_status():
+
+    return engine.learning.status()
+
+
+# ============================================================
+# ACTIONS
+# ============================================================
+
+@app.get(
+    "/actions"
+)
+async def list_actions():
+
+    return {
+
+        "count": len(
+            action_registry.names()
+        ),
+
+        "actions": action_registry.names(),
+
+    }
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event(
+    "startup"
+)
+async def startup_event():
+
+    print()
+
+    print("=" * 70)
+
+    print(
+        "☁️  JARVIS CLOUD STARTED"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"Actions: "
+        f"{len(action_registry.names())}"
+    )
+
+    print(
+        f"Persistent tasks: "
+        f"{len(tasks)}"
+    )
+
+    print(
+        f"Task storage: "
+        f"{TASK_FILE}"
+    )
+
+    print("=" * 70)

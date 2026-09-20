@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>JARVIS // MARK LIII — COMMAND CENTER</title>
+<link rel="stylesheet" href="/hud/hud.css">
+</head>
+<body class="hud-body">
+<div class="hud-grid-bg" aria-hidden="true"></div>
+<div class="hud-scanlines" aria-hidden="true"></div>
+<div class="hud-corners" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+
+<div class="hud-shell">
+
+  <!-- ===================== HEADER ===================== -->
+  <header class="hud-header">
+    <div class="hud-header__left">
+      <div class="hud-logo" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div>
+        <div class="hud-header__brand">MARK <b>LIII</b></div>
+        <div class="hud-header__sub" id="headerCoreTag">CORE // STANDBY</div>
+      </div>
+    </div>
+
+    <div class="hud-header__center">
+      <h1 class="hud-title">JARVIS</h1>
+      <p class="hud-subtitle">Just A Rather Very Intelligent System</p>
+    </div>
+
+    <div class="hud-header__right">
+      <div class="hud-clock">
+        <div class="hud-clock__time" id="clockTime">--:--:--</div>
+        <div class="hud-clock__date" id="clockDate">—</div>
+      </div>
+      <div class="hud-icons">
+        <span class="hud-icon" id="iconLink" title="Cloud link">◈</span>
+        <span class="hud-icon" id="iconAgent" title="Mac agent presence">◆</span>
+        <span class="hud-icon" id="iconMic" title="Microphone">◇</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===================== MAIN GRID ===================== -->
+  <main class="hud-main">
+
+    <!-- LEFT COLUMN -->
+    <div class="hud-column hud-column--left">
+      <div class="hud-slot" data-slot="system-monitor"></div>
+      <div class="hud-slot" data-slot="devices"></div>
+      <div class="hud-slot" data-slot="quick-actions"></div>
+    </div>
+
+    <!-- CENTER: speech | reactor | ai core -->
+    <div class="hud-column hud-column--center">
+      <div class="hud-slot hud-slot--speech" data-slot="speech"></div>
+      <div class="hud-slot hud-slot--reactor" data-slot="reactor"></div>
+      <div class="hud-slot hud-slot--aicore" data-slot="ai-core"></div>
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="hud-column hud-column--right">
+      <div class="hud-slot" data-slot="activity"></div>
+      <div class="hud-slot" data-slot="upload"></div>
+      <div class="hud-slot" data-slot="command"></div>
+    </div>
+  </main>
+
+  <!-- ===================== BOTTOM PANELS ===================== -->
+  <section class="hud-bottom">
+    <div class="hud-slot" data-slot="tasks"></div>
+    <div class="hud-slot" data-slot="permissions"></div>
+    <div class="hud-slot" data-slot="system-status"></div>
+  </section>
+
+  <!-- ===================== FOOTER ===================== -->
+  <footer class="hud-footer">
+    <span>J.A.R.V.I.S <b>v3.0</b> | MARK LIII</span>
+    <span class="hud-footer__mid" id="footerStatus">SYSTEM READY</span>
+    <span>By Dharun <i>//</i> Make it Real</span>
+  </footer>
+</div>
+
+<noscript>
+  <p style="padding:20px;color:#d8f6ff">
+    The JARVIS command center requires JavaScript (ES modules) to reach the Cloud API.
+  </p>
+</noscript>
+
+<script type="module" src="/hud/js/main.js"></script>
+</body>
+</html>

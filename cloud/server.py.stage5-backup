@@ -1,0 +1,1268 @@
+from __future__ import annotations
+
+import json
+import uuid
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from core.action_loader import discover_actions
+from automation.autonomous_engine import AutonomousEngine
+from automation.autonomous_planner import AutonomousPlanner
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+app = FastAPI(
+    title="JARVIS Cloud",
+    version="1.0.0",
+)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+ACTION_DIR = BASE_DIR / "actions"
+CONFIG_FILE = BASE_DIR / "config" / "api_keys.json"
+TASK_FILE = BASE_DIR / "cloud" / "tasks.json"
+
+# A claim is deliberately short-lived.  The Mac agent renews it while a plan is
+# running, so a stopped agent cannot leave a task permanently stranded.
+LEASE_SECONDS = 60
+RECOVERY_SCAN_SECONDS = 10
+MAX_SAFE_RECOVERY_ATTEMPTS = 3
+MAX_BLOCKED_ACTION_RECOVERY_REPLANS = 3
+PLANNING_TIMEOUT_SECONDS = 300
+MAX_PLANNING_ATTEMPTS = 3
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def current_time() -> str:
+    return datetime.now().isoformat()
+
+
+def expires_at() -> str:
+    return (datetime.now() + timedelta(seconds=LEASE_SECONDS)).isoformat()
+
+
+def parse_time(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def plan_steps(plan: Any) -> list[Any]:
+    """Read plan steps from serialized plans and planner Plan objects."""
+    if isinstance(plan, dict):
+        steps = plan.get("tasks")
+    else:
+        steps = getattr(plan, "tasks", None)
+    return steps if isinstance(steps, list) else []
+
+
+def step_value(step: Any, name: str, default: Any = None) -> Any:
+    """Read a field from either serialized data or a planner Task object."""
+    if isinstance(step, dict):
+        return step.get(name, default)
+    return getattr(step, name, default)
+
+
+def step_parameters(step: Any) -> Dict[str, Any]:
+    parameters = step_value(step, "parameters", {})
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
+def plan_is_safe_to_retry(plan: Any) -> bool:
+    """Retry only operations the Mac agent already permits automatically.
+
+    This intentionally mirrors, rather than expands, the agent safety policy.
+    An unknown, blocked, or side-effecting action is sent to human review after
+    a lost lease instead of being executed a second time.
+    """
+    steps = plan_steps(plan)
+    if not steps:
+        return False
+    for step in steps:
+        action = step_value(step, "action")
+        parameters = step_parameters(step)
+        if action == "open_app":
+            continue
+        if (
+            action == "browser_control"
+            and isinstance(parameters, dict)
+            and str(parameters.get("action", "")).lower().strip()
+            in {"go_to", "open", "navigate"}
+        ):
+            continue
+        return False
+    return True
+
+
+def blocked_step_from_result(result: Any) -> Optional[tuple[int, Dict[str, Any]]]:
+    """Return the first safety-blocked execution result, if one was reported."""
+    if not isinstance(result, dict):
+        return None
+    steps = result.get("steps")
+    if not isinstance(steps, list):
+        return None
+    for index, step in enumerate(steps):
+        if (
+            isinstance(step, dict)
+            and step.get("success") is False
+            and step.get("status") == "blocked"
+        ):
+            return index, step
+    return None
+
+
+def blocked_recovery_context(task: Dict[str, Any], result: Any) -> Optional[Dict[str, Any]]:
+    """Build durable, planner-facing context without losing execution evidence."""
+    blocked = blocked_step_from_result(result)
+    if blocked is None:
+        return None
+
+    blocked_index, blocked_result = blocked
+    planned_steps = plan_steps(task.get("plan"))
+
+    completed_steps = []
+    reported_steps = result.get("steps", [])
+    for index, reported_step in enumerate(reported_steps[:blocked_index]):
+        if not isinstance(reported_step, dict) or not reported_step.get("success"):
+            continue
+        planned_step = planned_steps[index] if index < len(planned_steps) else {}
+        completed_steps.append({
+            "action": step_value(planned_step, "action", reported_step.get("action")),
+            "parameters": step_parameters(planned_step),
+            "description": step_value(planned_step, "description", ""),
+            "result": reported_step.get("result"),
+        })
+
+    planned_failure = planned_steps[blocked_index] if blocked_index < len(planned_steps) else {}
+    return {
+        "original_goal": task.get("goal"),
+        "completed_steps": completed_steps,
+        "failed_step": {
+            "action": blocked_result.get("action", step_value(planned_failure, "action")),
+            "parameters": step_parameters(planned_failure),
+            "description": step_value(planned_failure, "description", ""),
+            "status": blocked_result.get("status"),
+            "failure_reason": blocked_result.get("result"),
+        },
+    }
+
+
+async def recover_blocked_action(task: Dict[str, Any], recovery_context: Dict[str, Any]) -> None:
+    """Replan a safety-blocked task, retaining the original execution record."""
+    attempts = int(task.get("blocked_recovery_attempt_count", 0))
+    if attempts >= MAX_BLOCKED_ACTION_RECOVERY_REPLANS:
+        task["status"] = "needs_review"
+        task["error"] = "Blocked-action recovery attempt limit reached."
+        task["recovery_reason"] = task["error"]
+        task["completed_at"] = current_time()
+        return
+
+    task["blocked_recovery_attempt_count"] = attempts + 1
+    try:
+        replacement = await asyncio.to_thread(
+            planner.plan,
+            task["goal"],
+            False,
+            recovery_context,
+        )
+        replacement_data = replacement if isinstance(replacement, dict) else plan_to_data(replacement)
+        if not plan_is_safe_to_retry(replacement_data):
+            raise ValueError("Planner did not produce a Mac-safe alternative plan.")
+    except Exception as exc:
+        task["status"] = "needs_review"
+        task["error"] = str(exc)
+        task["recovery_reason"] = f"Blocked-action recovery failed: {exc}"
+        task["completed_at"] = current_time()
+        return
+
+    task["plan"] = replacement_data
+    task["status"] = "planned" if task.get("device") == "cloud" else "queued"
+    task["planned_at"] = current_time()
+    task["completed_at"] = None
+    task["error"] = None
+    task["recovery_reason"] = "Blocked action recovered with a Mac-safe alternative plan."
+
+
+def recover_expired_leases() -> int:
+    """Recover abandoned work without replaying unsafe or ambiguous plans."""
+    now = datetime.now()
+    recovered = 0
+    for task in tasks.values():
+        if task.get("status") != "running":
+            continue
+        expiry = parse_time(task.get("lease_expires_at"))
+        # Legacy running tasks have no lease.  Treat them as abandoned rather
+        # than preserving an unrecoverable state forever.
+        if expiry is not None and expiry > now:
+            continue
+
+        attempts = int(task.get("attempt_count", 0))
+        if plan_is_safe_to_retry(task.get("plan")) and attempts < MAX_SAFE_RECOVERY_ATTEMPTS:
+            task["status"] = "queued"
+            task["recovery_reason"] = "Agent lease expired; safe plan requeued."
+            task["recovered_at"] = current_time()
+        else:
+            task["status"] = "needs_review"
+            task["recovery_reason"] = (
+                "Agent lease expired after work may have started; automatic replay is unsafe."
+            )
+            task["completed_at"] = current_time()
+        task["lease_id"] = None
+        task["lease_expires_at"] = None
+        recovered += 1
+    if recovered:
+        save_tasks()
+    return recovered
+
+
+def plan_to_data(plan: Any) -> Any:
+    if hasattr(plan, "to_dict"):
+        return plan.to_dict()
+    if hasattr(plan, "__dict__"):
+        return dict(plan.__dict__)
+    return str(plan)
+
+
+async def recover_stalled_planning() -> int:
+    """Retry interrupted/transient planning without replaying desktop work."""
+    now = datetime.now()
+    candidates = []
+    for task in tasks.values():
+        if task.get("status") != "planning":
+            continue
+        started = parse_time(task.get("planning_started_at") or task.get("created_at"))
+        if started is None or started + timedelta(seconds=PLANNING_TIMEOUT_SECONDS) <= now:
+            candidates.append(task)
+
+    for task in candidates:
+        attempts = int(task.get("planning_attempt_count", 0))
+        if attempts >= MAX_PLANNING_ATTEMPTS:
+            task["status"] = "planning_failed"
+            task["error"] = task.get("error") or "Planning retry limit reached."
+            task["completed_at"] = current_time()
+            continue
+
+        task["planning_attempt_count"] = attempts + 1
+        task["planning_started_at"] = current_time()
+        task["error"] = None
+        save_tasks()
+        try:
+            plan = await asyncio.to_thread(planner.plan, task["goal"])
+            task["plan"] = plan_to_data(plan)
+            task["status"] = "planned" if task.get("device") == "cloud" else "queued"
+            task["planned_at"] = current_time()
+        except Exception as exc:
+            # Remain recoverable until the bounded planning retry budget ends.
+            task["status"] = "planning"
+            task["error"] = str(exc)
+        save_tasks()
+    return len(candidates)
+
+
+# ============================================================
+# LOAD API CONFIG
+# ============================================================
+
+if not CONFIG_FILE.exists():
+    raise RuntimeError(
+        f"Config file not found: {CONFIG_FILE}"
+    )
+
+with CONFIG_FILE.open(
+    "r",
+    encoding="utf-8",
+) as f:
+    config = json.load(f)
+
+gemini_api_key = config.get(
+    "gemini_api_key"
+)
+
+if not gemini_api_key:
+    raise RuntimeError(
+        "gemini_api_key not found in config/api_keys.json"
+    )
+
+
+# ============================================================
+# TASK STORAGE
+# ============================================================
+
+tasks: Dict[str, Dict[str, Any]] = {}
+
+
+def load_tasks() -> None:
+    global tasks
+
+    TASK_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if not TASK_FILE.exists():
+        tasks = {}
+        return
+
+    try:
+        with TASK_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            tasks = data
+            # Older persisted tasks predate leases.  Preserve their history but
+            # give all future claims the recovery fields expected by this version.
+            for task in tasks.values():
+                if not isinstance(task, dict):
+                    continue
+                task.setdefault("attempt_count", 0)
+                task.setdefault("lease_id", None)
+                task.setdefault("lease_expires_at", None)
+                task.setdefault("heartbeat_at", None)
+                task.setdefault("completed_by_lease_id", None)
+                task.setdefault("recovery_reason", None)
+                task.setdefault("recovered_at", None)
+                task.setdefault("planning_attempt_count", 0)
+                task.setdefault("planning_started_at", task.get("created_at"))
+                task.setdefault("blocked_recovery_attempt_count", 0)
+                task.setdefault("blocked_recovery_history", [])
+        else:
+            tasks = {}
+
+    except Exception as exc:
+        print(
+            f"[JARVIS Cloud] "
+            f"Could not load tasks: {exc}"
+        )
+
+        tasks = {}
+
+
+def save_tasks() -> None:
+    TASK_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_file = TASK_FILE.with_suffix(".tmp")
+
+    def make_json_safe(value):
+        if value is None or isinstance(
+            value,
+            (str, int, float, bool),
+        ):
+            return value
+
+        if hasattr(value, "to_dict"):
+            try:
+                return make_json_safe(value.to_dict())
+            except Exception:
+                pass
+
+        if hasattr(value, "__dataclass_fields__"):
+            try:
+                from dataclasses import asdict
+                return make_json_safe(asdict(value))
+            except Exception:
+                pass
+
+        if isinstance(value, dict):
+            return {
+                str(key): make_json_safe(item)
+                for key, item in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [
+                make_json_safe(item)
+                for item in value
+            ]
+
+        return str(value)
+
+    try:
+        safe_tasks = make_json_safe(tasks)
+
+        with temporary_file.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                safe_tasks,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        temporary_file.replace(
+            TASK_FILE
+        )
+
+    except Exception as exc:
+        print(
+            f"[JARVIS Cloud] "
+            f"Could not save tasks: {exc}"
+        )
+
+
+load_tasks()
+
+
+# ============================================================
+# JARVIS BRAIN
+# ============================================================
+
+action_registry = discover_actions(
+    ACTION_DIR
+)
+
+print(
+    f"[JARVIS] Loaded "
+    f"{len(action_registry.names())} actions"
+)
+
+
+engine = AutonomousEngine(
+    action_registry=action_registry,
+    context={
+        "platform": "cloud",
+    },
+    logger=lambda msg: print(
+        f"[Autonomous] {msg}"
+    ),
+)
+
+
+planner = AutonomousPlanner(
+    action_registry=action_registry,
+    learning_memory=engine.learning,
+    api_key=gemini_api_key,
+    logger=lambda msg: print(
+        f"[Planner] {msg}"
+    ),
+)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+class TaskRequest(BaseModel):
+
+    goal: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+    )
+
+    device: str = Field(
+        default="cloud",
+        min_length=1,
+        max_length=100,
+    )
+
+
+class TaskClaimRequest(BaseModel):
+
+    device: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+
+
+class TaskHeartbeatRequest(BaseModel):
+
+    device: str = Field(..., min_length=1, max_length=100)
+    lease_id: str = Field(..., min_length=1, max_length=100)
+
+
+class TaskResultRequest(BaseModel):
+
+    status: str = Field(
+        default="completed",
+        min_length=1,
+        max_length=50,
+    )
+
+    result: Any = None
+
+    error: Optional[str] = None
+
+    # A result is accepted only from the worker that owns the active lease.
+    # Retaining this value also makes a retry after a lost HTTP response safe.
+    device: str = Field(..., min_length=1, max_length=100)
+    lease_id: str = Field(..., min_length=1, max_length=100)
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "name": "JARVIS Cloud",
+        "version": "1.0.0",
+        "status": "online",
+        "actions": len(
+            action_registry.names()
+        ),
+        "tasks": len(tasks),
+        "storage": "persistent",
+        "time": current_time(),
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "healthy",
+        "actions": len(
+            action_registry.names()
+        ),
+        "tasks": len(tasks),
+        "storage": "persistent",
+    }
+
+
+# ============================================================
+# TASK STATUS SUMMARY
+# ============================================================
+
+@app.get("/tasks/status/summary")
+async def task_summary():
+
+    summary: Dict[str, int] = {}
+
+    for task in tasks.values():
+
+        status = task.get(
+            "status",
+            "unknown",
+        )
+
+        summary[status] = (
+            summary.get(
+                status,
+                0,
+            )
+            + 1
+        )
+
+    return {
+        "total": len(tasks),
+        "statuses": summary,
+    }
+
+
+# ============================================================
+# LIST TASKS
+# ============================================================
+
+@app.get("/tasks")
+async def list_tasks():
+
+    return list(
+        tasks.values()
+    )
+
+
+# ============================================================
+# CREATE TASK
+# ============================================================
+
+@app.post("/tasks")
+async def create_task(
+    request: TaskRequest,
+):
+
+    task_id = str(
+        uuid.uuid4()
+    )
+
+    print()
+    print("=" * 60)
+
+    print(
+        f"[JARVIS Cloud] "
+        f"New task: {request.goal}"
+    )
+
+    print(
+        f"[JARVIS Cloud] "
+        f"Target device: {request.device}"
+    )
+
+    print("=" * 60)
+
+    task = {
+
+        "id": task_id,
+
+        "goal": request.goal,
+
+        "device": request.device,
+
+        "status": "planning",
+
+        "plan": None,
+
+        "result": None,
+
+        "error": None,
+
+        "created_at": current_time(),
+
+        "planned_at": None,
+
+        "claimed_at": None,
+
+        "completed_at": None,
+
+        "claimed_by": None,
+
+        # Recovery metadata.  Kept with the task so Cloud restarts preserve
+        # the ownership and retry decision rather than guessing from logs.
+        "attempt_count": 0,
+        "lease_id": None,
+        "lease_expires_at": None,
+        "heartbeat_at": None,
+        "completed_by_lease_id": None,
+        "recovery_reason": None,
+        "recovered_at": None,
+        "planning_attempt_count": 1,
+        "planning_started_at": current_time(),
+        "blocked_recovery_attempt_count": 0,
+        "blocked_recovery_history": [],
+    }
+
+    tasks[task_id] = task
+
+    save_tasks()
+
+    try:
+
+        plan = planner.plan(
+            request.goal
+        )
+
+        plan_data = plan_to_data(plan)
+
+        task["plan"] = plan_data
+
+        if request.device == "cloud":
+
+            task["status"] = "planned"
+
+        else:
+
+            task["status"] = "queued"
+
+        task["planned_at"] = (
+            current_time()
+        )
+
+        save_tasks()
+
+        print(
+            "[JARVIS Cloud] "
+            "Plan generated successfully."
+        )
+
+        return task
+
+    except Exception as exc:
+
+        # Keep transient planning failures recoverable.  The background worker
+        # retries with a bounded budget and eventually marks it failed.
+        task["status"] = "planning"
+
+        task["error"] = str(
+            exc
+        )
+
+        save_tasks()
+
+        print(
+            f"[JARVIS Cloud] "
+            f"Planning failed: {exc}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
+# ============================================================
+# DEVICE QUEUE
+# ============================================================
+
+@app.get(
+    "/devices/{device}/tasks"
+)
+async def get_device_tasks(
+    device: str,
+):
+
+    return [
+
+        task
+
+        for task in tasks.values()
+
+        if (
+
+            task.get(
+                "device"
+            )
+            == device
+
+            and
+
+            task.get(
+                "status"
+            )
+            == "queued"
+
+        )
+
+    ]
+
+
+# ============================================================
+# CLAIM TASK
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/claim"
+)
+async def claim_task(
+    task_id: str,
+    request: TaskClaimRequest,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    if task.get(
+        "status"
+    ) != "queued":
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task cannot be claimed. "
+                f"Current status: "
+                f"{task.get('status')}"
+            ),
+        )
+
+    if task.get(
+        "device"
+    ) != request.device:
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task belongs to "
+                f"'{task.get('device')}'."
+            ),
+        )
+
+    task["status"] = "running"
+
+    task["claimed_by"] = (
+        request.device
+    )
+
+    task["claimed_at"] = (
+        current_time()
+    )
+
+    task["attempt_count"] = int(task.get("attempt_count", 0)) + 1
+    task["lease_id"] = str(uuid.uuid4())
+    task["lease_expires_at"] = expires_at()
+    task["heartbeat_at"] = current_time()
+    task["recovery_reason"] = None
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# RENEW TASK LEASE
+# ============================================================
+
+@app.post("/tasks/{task_id}/heartbeat")
+async def heartbeat_task(task_id: str, request: TaskHeartbeatRequest):
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") != "running":
+        raise HTTPException(status_code=409, detail="Task is not running")
+    if task.get("claimed_by") != request.device or task.get("lease_id") != request.lease_id:
+        raise HTTPException(status_code=409, detail="Task lease is not owned by this agent")
+
+    task["heartbeat_at"] = current_time()
+    task["lease_expires_at"] = expires_at()
+    save_tasks()
+    return {"task_id": task_id, "lease_expires_at": task["lease_expires_at"]}
+
+
+# ============================================================
+# GET SINGLE TASK
+# ============================================================
+
+@app.get(
+    "/tasks/{task_id}"
+)
+async def get_task(
+    task_id: str,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    return task
+
+
+# ============================================================
+# UPDATE RESULT + LEARNING
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/result"
+)
+async def update_task_result(
+    task_id: str,
+    request: TaskResultRequest,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    allowed_statuses = {
+
+        "completed",
+
+        "failed",
+
+        "cancelled",
+
+    }
+
+    if request.status not in allowed_statuses:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid status. "
+                f"Allowed: "
+                f"{sorted(allowed_statuses)}"
+            ),
+        )
+
+    # If the server committed the result but its response was lost, the agent's
+    # outbox will submit the same record again.  Accept that exact replay even
+    # if blocked-action recovery has already queued a replacement; it must not
+    # mutate a newer lease or task state.
+    if (
+        task.get("completed_by_lease_id") == request.lease_id
+        and task.get("claimed_by") == request.device
+        and task.get("result") == request.result
+    ):
+        return task
+
+    # Never let an old worker overwrite a cancellation or a newer lease.
+    if task.get("status") in {"completed", "failed"}:
+        if (
+            task.get("completed_by_lease_id") == request.lease_id
+            and task.get("claimed_by") == request.device
+        ):
+            return task
+        raise HTTPException(status_code=409, detail="Task is already finished")
+
+    if task.get("status") != "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task cannot accept a result. Current status: {task.get('status')}",
+        )
+
+    if task.get("claimed_by") != request.device or task.get("lease_id") != request.lease_id:
+        raise HTTPException(status_code=409, detail="Task lease is not owned by this agent")
+
+    recovery_context = None
+    if request.status == "failed":
+        recovery_context = blocked_recovery_context(task, request.result)
+
+    # ----------------------------------------------------------
+    # UPDATE RESULT
+    # ----------------------------------------------------------
+
+    task["status"] = (
+        request.status
+    )
+
+    task["result"] = (
+        request.result
+    )
+
+    task["error"] = (
+        request.error
+    )
+
+    task["completed_at"] = (
+        current_time()
+    )
+    task["completed_by_lease_id"] = request.lease_id
+    task["lease_expires_at"] = None
+
+    # A safety-policy block is distinct from an ordinary execution failure.
+    # Preserve its evidence, then attempt a bounded, safe-only replacement
+    # plan. The active lease is cleared before planning so a stale worker can
+    # never submit a result against a subsequently claimed replacement task.
+    if recovery_context is not None:
+        history = task.setdefault("blocked_recovery_history", [])
+        history.append({
+            "at": current_time(),
+            "lease_id": request.lease_id,
+            "context": recovery_context,
+        })
+        task["status"] = "recovering"
+        task["lease_id"] = None
+        await recover_blocked_action(task, recovery_context)
+        save_tasks()
+        return task
+
+    # ----------------------------------------------------------
+    # LEARN SUCCESSFUL WORKFLOW
+    # ----------------------------------------------------------
+    #
+    # The Mac Agent executes the plan, not the Cloud engine.
+    # Therefore we learn directly from the successful plan/result
+    # reported by the Mac Agent.
+    # ----------------------------------------------------------
+
+    if request.status == "completed":
+
+        plan = task.get("plan") or {}
+        planned_steps = plan.get("tasks") or []
+
+        # Only learn when the agent actually reported successful
+        # execution of the steps.
+        reported_result = request.result
+
+        reported_steps = []
+
+        if isinstance(reported_result, dict):
+            reported_steps = (
+                reported_result.get("steps")
+                or []
+            )
+
+        successful_execution = True
+
+        if not reported_steps:
+            successful_execution = False
+
+        else:
+            for reported_step in reported_steps:
+
+                if not isinstance(
+                    reported_step,
+                    dict,
+                ):
+                    successful_execution = False
+                    break
+
+                if not reported_step.get(
+                    "success",
+                    False,
+                ):
+                    successful_execution = False
+                    break
+
+        if (
+            successful_execution
+            and planned_steps
+        ):
+
+            try:
+
+                learned_steps = []
+
+                for step in planned_steps:
+
+                    if not isinstance(
+                        step,
+                        dict,
+                    ):
+                        continue
+
+                    action = step.get(
+                        "action"
+                    )
+
+                    if not action:
+                        continue
+
+                    learned_steps.append({
+                        "action": action,
+                        "parameters": dict(
+                            step.get(
+                                "parameters",
+                                {},
+                            )
+                        ),
+                        "description": str(
+                            step.get(
+                                "description",
+                                "",
+                            )
+                        ),
+                    })
+
+                if learned_steps:
+
+                    workflow_name = (
+                        "Cloud: "
+                        f"{task['goal'][:60]}"
+                    )
+
+                    workflow = engine.learning.learn(
+                        name=workflow_name,
+                        goal=task["goal"],
+                        steps=learned_steps,
+                    )
+
+                    print(
+                        "[JARVIS Cloud] "
+                        "🧠 Learned workflow: "
+                        f"{workflow.name}"
+                    )
+
+                    print(
+                        "[JARVIS Cloud] "
+                        f"   Steps learned: "
+                        f"{len(workflow.steps)}"
+                    )
+
+                    print(
+                        "[JARVIS Cloud] "
+                        f"   Success count: "
+                        f"{workflow.success_count}"
+                    )
+
+            except Exception as exc:
+
+                print(
+                    "[JARVIS Cloud] "
+                    f"⚠️ Learning failed: {exc}"
+                )
+
+        else:
+
+            print(
+                "[JARVIS Cloud] "
+                "⚠️ Not learning task because "
+                "successful step results were not confirmed."
+            )
+
+    # ----------------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------------
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# CANCEL TASK
+# ============================================================
+
+@app.post(
+    "/tasks/{task_id}/cancel"
+)
+async def cancel_task(
+    task_id: str,
+):
+
+    task = tasks.get(
+        task_id
+    )
+
+    if task is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Task not found",
+        )
+
+    if task.get(
+        "status"
+    ) in {
+
+        "completed",
+
+        "failed",
+
+        "cancelled",
+
+    }:
+
+        raise HTTPException(
+            status_code=409,
+            detail="Task is already finished.",
+        )
+
+    task["status"] = (
+        "cancelled"
+    )
+
+    task["lease_expires_at"] = None
+    task["recovery_reason"] = "Cancelled by user."
+
+    task["completed_at"] = (
+        current_time()
+    )
+
+    save_tasks()
+
+    return task
+
+
+# ============================================================
+# MEMORY STATUS
+# ============================================================
+
+@app.get(
+    "/memory/status"
+)
+async def memory_status():
+
+    return engine.learning.status()
+
+
+# ============================================================
+# ACTIONS
+# ============================================================
+
+@app.get(
+    "/actions"
+)
+async def list_actions():
+
+    return {
+
+        "count": len(
+            action_registry.names()
+        ),
+
+        "actions": action_registry.names(),
+
+    }
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event(
+    "startup"
+)
+async def startup_event():
+
+    # Deal with leases that expired while the service was down before workers
+    # can poll again.  A lightweight periodic scan covers later agent crashes.
+    recover_expired_leases()
+    await recover_stalled_planning()
+
+    async def recovery_loop():
+        while True:
+            await asyncio.sleep(RECOVERY_SCAN_SECONDS)
+            recover_expired_leases()
+            await recover_stalled_planning()
+
+    app.state.recovery_task = asyncio.create_task(recovery_loop())
+
+    print()
+    print("=" * 70)
+    print(
+        "☁️  JARVIS CLOUD STARTED"
+    )
+
+    print("=" * 70)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    recovery_task = getattr(app.state, "recovery_task", None)
+    if recovery_task:
+        recovery_task.cancel()
+
+    print(
+        f"Actions: "
+        f"{len(action_registry.names())}"
+    )
+
+    print(
+        f"Persistent tasks: "
+        f"{len(tasks)}"
+    )
+
+    print(
+        f"Task storage: "
+        f"{TASK_FILE}"
+    )
+
+    print("=" * 70)
