@@ -27,6 +27,7 @@ cloud/activity.json
 automation/*backup*
 automation/*before_router*
 automation/learning_memory.json
+automation/engineering_memory.json
 automation/permissions.json
 *.log
 uploads

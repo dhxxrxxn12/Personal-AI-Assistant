@@ -276,6 +276,19 @@ Mark LIII/
 
 ---
 
+## 🛠️ Controlled self-engineering
+
+JARVIS includes an isolated, opt-in engineering foundation under
+`automation/self_engineering/`. It can produce a bounded repository inventory,
+identify capability gaps, validate structured plans, run tests, analyze
+failures, and coordinate a finite repair loop. File changes, Git checkpoints,
+and sandbox operations are separate allowlisted operations that require policy
+approval; the Cloud planner and Mac Agent do not activate this system
+automatically.
+
+See [`docs/self-engineering.md`](docs/self-engineering.md) for the lifecycle,
+protected paths, rollback procedure, sandbox boundary, and recovery guidance.
+
 ## ⚠️ License
 
 Personal and non-commercial use only.

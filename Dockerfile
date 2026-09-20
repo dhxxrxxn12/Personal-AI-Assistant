@@ -19,6 +19,7 @@ RUN python -m pip install --no-cache-dir --requirement requirements-cloud.txt
 # HUD. The desktop main.py and Mac Agent are intentionally not copied or run.
 COPY --chown=jarvis:jarvis cloud/ cloud/
 COPY --chown=jarvis:jarvis automation/autonomous_engine.py automation/autonomous_planner.py automation/learning_memory.py automation/permission_manager.py automation/simple_intent_router.py automation/
+COPY --chown=jarvis:jarvis automation/self_engineering/ automation/self_engineering/
 COPY --chown=jarvis:jarvis actions/ actions/
 COPY --chown=jarvis:jarvis core/__init__.py core/action_loader.py core/confirm.py core/runtime_config.py core/undo.py core/
 COPY --chown=jarvis:jarvis config/__init__.py config/

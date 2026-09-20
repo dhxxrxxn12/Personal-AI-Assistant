@@ -40,6 +40,6 @@ Audit baseline: 20 September 2026, commit `9a3b1f8`.
 
 - Repository-local `__pycache__/`, `*.pyc`, `.pytest_cache/`, and `.DS_Store` files: generated locally and removed from the working tree.
 - `.venv/`: local environment retained, never included in the repository or Docker build.
-- Runtime JSON stores and local outbox files: retained on disk where present, ignored because they contain user/task state.
+- Runtime JSON stores and local outbox files, including `automation/engineering_memory.json`: retained on disk where present, ignored because they contain user/task state.
 
 No persistent runtime data, production modules, active actions, configuration secrets, deployment files, or Mac Agent files were removed.

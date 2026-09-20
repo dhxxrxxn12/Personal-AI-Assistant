@@ -75,6 +75,7 @@ logs or paste them into source control.
 | `JARVIS_PLANNER_MODEL` | C — optional Cloud configuration | Planner model override; defaults to `gemini-flash-latest`. |
 | `JARVIS_LIVE_MODEL` | C — optional Cloud configuration | Browser voice model override; defaults to `gemini-3.8-live`. |
 | `JARVIS_LIVE_API_VERSION` | C — optional Cloud configuration | Gemini Live API version; defaults to `v1beta`. |
+| `JARVIS_SELF_ENGINEERING_ENABLED` | C — local supervised development only | Defaults to `0`; keep disabled in production until a separate approval workflow is deployed. |
 | `JARVIS_AGENT_ID` | D — Mac-Agent-only | Optional; defaults to `mac-main`. |
 | `JARVIS_AGENT_CONNECT_TIMEOUT` | D — Mac-Agent-only | Optional; default `10` seconds. |
 | `JARVIS_AGENT_LEASE_HEARTBEAT_SECONDS` | D — Mac-Agent-only | Optional; default `15` seconds. |
@@ -100,6 +101,15 @@ is not required for deployment. Optional model overrides are
 `JARVIS_PLANNER_MODEL` (default `gemini-flash-latest`), `JARVIS_LIVE_MODEL`
 (default `gemini-3.8-live`), and `JARVIS_LIVE_API_VERSION`
 (default `v1beta`). These values are configuration, not credentials.
+
+## Controlled self-engineering
+
+The isolated `automation/self_engineering/` subsystem is disabled by default
+and is not part of the Cloud request path. Enable it only in a supervised local
+workspace with `JARVIS_SELF_ENGINEERING_ENABLED=1`. Production deployment,
+credential changes, external communication, and persistent-data deletion remain
+outside its automatic authority. Review its trace and diff, create a checkpoint,
+and verify a separate sandbox before considering any production action.
 
 ## Persistent data
 

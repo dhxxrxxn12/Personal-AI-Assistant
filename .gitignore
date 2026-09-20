@@ -69,6 +69,7 @@ cloud/tasks.json
 cloud/devices.json
 cloud/activity.json
 automation/learning_memory.json
+automation/engineering_memory.json
 automation/permissions.json
 uploads/
 agent/mac_agent_outbox.json

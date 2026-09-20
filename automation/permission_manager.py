@@ -85,6 +85,19 @@ class PermissionManager:
         "file_processor",
     }
 
+    # Read-only self-engineering operations are safe by default. Mutating
+    # engineering operations remain confirmation-gated by the normal unknown
+    # action policy below.
+    DEFAULT_ENGINEERING_SAFE_ACTIONS = {
+        "inspect_repository",
+        "read_source",
+        "run_test",
+        "run_static_check",
+        "inspect_diff",
+        "verify_deployment",
+        "record_memory",
+    }
+
     # ==========================================================
     # DEFAULT CONFIRM ACTIONS
     # ==========================================================
@@ -251,6 +264,11 @@ class PermissionManager:
 
             # Unknown infrastructure operation
             # must require confirmation.
+            return PermissionLevel.CONFIRM
+
+        if action == "self_engineering":
+            if parameters.get("action") in self.DEFAULT_ENGINEERING_SAFE_ACTIONS:
+                return PermissionLevel.SAFE
             return PermissionLevel.CONFIRM
 
         # ------------------------------------------------------
