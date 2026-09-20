@@ -40,6 +40,10 @@ const PANELS = [
 
 const voice = createVoice({
   onChange: (voiceState) => store.set({ voice: voiceState }),
+  getSessionTicket: async () => {
+    const session = await api.voiceSession();
+    return session.ticket;
+  },
 });
 
 const controller = createController({ voice });

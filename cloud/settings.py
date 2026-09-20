@@ -29,9 +29,9 @@ def _split_origins(raw: str) -> tuple[str, ...]:
 
 def _port_from_environment() -> int:
     try:
-        return max(1, int(os.getenv("PORT", os.getenv("JARVIS_PORT", "8000"))))
+        return max(1, int(os.getenv("PORT", os.getenv("JARVIS_PORT", "8080"))))
     except (TypeError, ValueError):
-        return 8000
+        return 8080
 
 
 @dataclass(frozen=True)

@@ -85,6 +85,7 @@ export const api = {
 
   systemMetrics: () => request("/system/metrics"),
   systemStatus: () => request("/system/status"),
+  voiceSession: () => request("/voice/session", { method: "POST" }),
 
   activity: (since = 0, limit = 200) =>
     request(`/activity?since=${encodeURIComponent(since)}&limit=${encodeURIComponent(limit)}`),

@@ -19,7 +19,10 @@ class SimpleIntentRouter:
         "finder": "Finder",
     }
 
-    _OPEN_APP_PATTERN = re.compile(r"^open\s+([a-z]+)$", re.IGNORECASE)
+    _OPEN_APP_PATTERN = re.compile(
+        r"^(?:open|launch|start)(?:\s+the)?\s+([a-z]+)$",
+        re.IGNORECASE,
+    )
 
     def route(self, goal: str) -> Optional[Plan]:
         if not isinstance(goal, str):

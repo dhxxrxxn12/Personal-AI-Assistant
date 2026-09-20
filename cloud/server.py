@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from core.action_loader import discover_actions
 from core.runtime_config import migrate_legacy_file
 from automation.autonomous_engine import AutonomousEngine
-from automation.autonomous_planner import AutonomousPlanner
+from automation.autonomous_planner import AutonomousPlanner, PlannerError
 from automation.simple_intent_router import SimpleIntentRouter
 from cloud import uploads as upload_store
 from cloud.activity_log import activity
@@ -29,6 +29,7 @@ from cloud.auth import require_admin, require_agent, validate_login_token
 from cloud.device_manager import device_manager
 from cloud.settings import settings
 from cloud.telemetry import health as telemetry_health, telemetry
+from cloud.voice import BrowserVoiceSession, voice_tickets
 
 # python-multipart is only needed by the command-center file drop; when it is
 # missing the API still starts and /files/upload answers 503.
@@ -456,21 +457,36 @@ def plan_to_data(plan: Any) -> Any:
     return str(plan)
 
 
+def planner_failure_details(error: Exception | str) -> tuple[str, str]:
+    """Return a safe planner message/kind for persistence and the HUD."""
+    if isinstance(error, PlannerError):
+        return error.public_message, error.kind
+    if isinstance(error, asyncio.TimeoutError):
+        return f"Planning timed out after {PLANNING_TIMEOUT_SECONDS} seconds.", "timeout"
+    # Preserve the stable legacy diagnostic used by local callers/tests; do
+    # not generalise this into returning arbitrary provider exception text.
+    if str(error) == "Gemini planning failed after fallback attempts":
+        return str(error), "planner_error"
+    return "Gemini planning failed; check Cloud configuration and provider status.", "planner_error"
+
+
 def fail_task_planning(task: Dict[str, Any], error: Exception | str) -> None:
     """Persist a terminal planner failure without reporting a false success."""
     if task.get("status") != "planning":
         return
 
+    message, kind = planner_failure_details(error)
     task["status"] = "failed"
-    task["error"] = str(error)
+    task["error"] = message
+    task["planner_error"] = kind
     task["plan"] = None
     task["planned_at"] = None
     task["completed_at"] = current_time()
-    telemetry_health.mark("gemini", False, str(error))
+    telemetry_health.mark("gemini", False, message)
     activity.publish(
         "ERROR",
-        f"Planning failed: {error}",
-        {"task_id": task.get("id"), "goal": task.get("goal")},
+        f"Planning failed: {message}",
+        {"task_id": task.get("id"), "goal": task.get("goal"), "kind": kind},
         level="error",
     )
     save_tasks()
@@ -514,7 +530,8 @@ async def finish_task_planning(task_id: str) -> None:
         # while Gemini was running.  Never overwrite that newer state.
         if task.get("status") == "planning":
             fail_task_planning(task, exc)
-        print(f"[PlannerWorker] Task {task_id} planning failed: {exc}")
+        message, kind = planner_failure_details(exc)
+        print(f"[PlannerWorker] Task {task_id} planning failed kind={kind}: {message}")
         return
 
     # Do not resurrect a task cancelled while the planner was running.
@@ -565,7 +582,8 @@ async def plan_task_in_background(task_id: str) -> None:
         task = tasks.get(task_id)
         if task is not None:
             fail_task_planning(task, exc)
-        print(f"[PlannerWorker] Task {task_id} planning failed: {exc}")
+        message, kind = planner_failure_details(exc)
+        print(f"[PlannerWorker] Task {task_id} planning failed kind={kind}: {message}")
     finally:
         planning_task_ids.discard(task_id)
         planning_workers.pop(task_id, None)
@@ -876,7 +894,11 @@ async def root():
 async def health():
 
     return {
-        "status": "healthy" if gemini_api_key else "degraded",
+        # Health is a liveness probe. Gemini configuration belongs to the
+        # readiness response and must not turn a live HTTP process into a
+        # failed platform health check.
+        "status": "ok",
+        "service": "jarvis-cloud",
         "actions": len(
             action_registry.names()
         ),
@@ -910,6 +932,34 @@ async def login(request: LoginRequest):
     if role is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"ok": True, "role": role, "token": request.token}
+
+
+@app.post("/voice/session", dependencies=[Depends(require_admin)])
+async def create_voice_session():
+    """Issue a one-use ticket for the browser-to-Gemini Live WebSocket."""
+    ticket, expires_in = voice_tickets.issue()
+    return {"ticket": ticket, "expires_in": expires_in}
+
+
+@app.websocket("/voice")
+async def browser_voice(websocket: WebSocket):
+    """Run one ticket-authenticated browser voice session."""
+    ticket = websocket.query_params.get("ticket", "")
+    if not voice_tickets.consume(ticket):
+        await websocket.close(code=4001)
+        return
+
+    await websocket.accept()
+
+    async def enqueue_voice_task(goal: str) -> Dict[str, Any]:
+        # Voice uses the same task endpoint and permission gate as typed
+        # commands.  The Mac Agent is the only execution target.
+        return await create_task(TaskRequest(goal=goal, device="mac-main"))
+
+    await BrowserVoiceSession(
+        api_key=gemini_api_key,
+        submit_task=enqueue_voice_task,
+    ).run(websocket)
 
 
 # ============================================================
@@ -2065,7 +2115,7 @@ async def activity_stream(since: int = 0):
         event_source(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

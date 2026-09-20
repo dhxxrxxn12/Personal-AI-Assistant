@@ -45,7 +45,9 @@ export function mount(ctx) {
   const micButton = h("button", { class: "btn btn--tiny", type: "button", text: "Enable Mic" });
   const muteButton = h("button", { class: "btn btn--tiny", type: "button", text: "Mute" });
   const wakeButton = h("button", { class: "btn btn--tiny", type: "button", text: "Wake Word" });
-  const listenButton = h("button", { class: "btn btn--tiny btn--primary", type: "button", text: "Listen" });
+  const listenButton = h("button", { class: "btn btn--tiny btn--primary", type: "button", text: "Start Voice" });
+  const interruptButton = h("button", { class: "btn btn--tiny", type: "button", text: "Interrupt" });
+  const transcriptNode = h("p", { class: "empty-note", text: "" });
   const note = h("p", { class: "empty-note", text: "" });
 
   panel.body.append(
@@ -56,7 +58,8 @@ export function mount(ctx) {
     ]),
     waveform,
     levelMeter,
-    h("div", { class: "speech-actions" }, [micButton, muteButton, wakeButton, listenButton]),
+    h("div", { class: "speech-actions" }, [micButton, muteButton, wakeButton, listenButton, interruptButton]),
+    transcriptNode,
     note
   );
 
@@ -164,16 +167,40 @@ export function mount(ctx) {
   });
 
   listenButton.addEventListener("click", async () => {
+    if (voice.isRealtime && voice.isRealtime()) {
+      voice.stopRealtime();
+      controller.logLocal("SYS", "Cloud voice stopped");
+      return;
+    }
+
+    const cloudVoiceStarted = voice.startRealtime ? await voice.startRealtime() : false;
+    if (cloudVoiceStarted) {
+      controller.logLocal("SYS", "Cloud voice connected — speak naturally");
+      return;
+    }
+
+    // Live is optional: keep the existing browser Web Speech path usable when
+    // the provider/model is unavailable or the browser cannot open a socket.
     if (store.state.voice.mic === "off") await voice.enable();
     const mic = voice.state().mic;
     if (mic !== "on" && mic !== "muted") {
       controller.logLocal("ERROR", "Cannot capture speech — microphone unavailable", "warn");
       return;
     }
+    if (store.state.voice.speechRecognition === "unsupported") {
+      controller.logLocal("ERROR", "Cloud voice unavailable and Web Speech is unsupported", "warn");
+      return;
+    }
+    controller.logLocal("SYS", "Cloud voice unavailable — using browser speech fallback", "warn");
     voice.setStatus("LISTENING");
     const heard = await voice.listenOnce();
     if (heard) controller.submitVoiceCommand(heard);
     else voice.setStatus("IDLE");
+  });
+
+  interruptButton.addEventListener("click", () => {
+    if (voice.interrupt) voice.interrupt();
+    controller.logLocal("USER", "Voice playback interrupted");
   });
 
   store.subscribe((state) => {
@@ -185,7 +212,7 @@ export function mount(ctx) {
       ? "on"
       : voiceState.wake === "unsupported" ? "unavailable" : "off";
     setText(statusNode, voiceState.status);
-    statusNode.dataset.state = voiceState.status === "LISTENING" ? "on" : "off";
+    statusNode.dataset.state = ["LISTENING", "THINKING", "SPEAKING"].includes(voiceState.status) ? "on" : "off";
 
     const closed = ["off", "denied", "error"].includes(voiceState.mic);
     micButton.textContent = closed ? "Enable Mic" : "Disable Mic";
@@ -193,19 +220,29 @@ export function mount(ctx) {
     muteButton.textContent = voiceState.mic === "muted" ? "Unmute" : "Mute";
     wakeButton.textContent = voiceState.wake === "on" ? "Wake: On" : "Wake: Off";
     wakeButton.disabled = voiceState.wake === "unsupported";
-    listenButton.disabled = voiceState.speechRecognition === "unsupported";
+    listenButton.disabled = voiceState.mic === "denied" || voiceState.mic === "error";
+    listenButton.textContent = voiceState.realtime === "connecting"
+      ? "Connecting…"
+      : voiceState.realtime === "connected" ? "Stop Voice" : "Start Voice";
+    interruptButton.disabled = voiceState.realtime !== "connected" || voiceState.status !== "SPEAKING";
 
     const level = Math.round(Math.max(0, Math.min(1, Number(voiceState.level) || 0)) * 100);
     levelFill.style.width = `${level}%`;
     setText(levelValue, `${level}%`);
+    setText(
+      transcriptNode,
+      voiceState.transcript ? `transcript: ${String(voiceState.transcript).slice(0, 180)}` : ""
+    );
 
     setText(
       note,
-      voiceState.speechRecognition === "unsupported"
-        ? "speech recognition unavailable — use command input"
-        : voiceState.error || `engine: web speech api · ${navigator.language}`
+      voiceState.realtime === "connected"
+        ? `engine: Gemini Live · ${voiceState.status.toLowerCase()}`
+        : voiceState.error || (voiceState.speechRecognition === "unsupported"
+          ? "speech recognition unavailable — use command input"
+          : `fallback: web speech api · ${navigator.language}`)
     );
-    panel.setMeta(`mic ${micLabel(voiceState.mic).toLowerCase()}`);
+    panel.setMeta(voiceState.realtime === "connected" ? "Gemini Live" : `mic ${micLabel(voiceState.mic).toLowerCase()}`);
     panel.setTone(voiceState.mic === "denied" || voiceState.mic === "error" ? "danger" : null);
   });
 

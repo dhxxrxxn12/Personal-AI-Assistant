@@ -26,7 +26,7 @@ from core.action_loader import discover_actions
 # CONFIG
 # ---------------------------------------------------------
 
-CLOUD_URL = os.getenv("JARVIS_CLOUD_URL", "http://127.0.0.1:8000").rstrip("/")
+CLOUD_URL = os.getenv("JARVIS_CLOUD_URL", "http://127.0.0.1:8080").rstrip("/")
 AGENT_TOKEN = os.getenv("JARVIS_AGENT_TOKEN", "").strip()
 ACTION_DIR = PROJECT_ROOT / "actions"
 

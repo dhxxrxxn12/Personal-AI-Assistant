@@ -19,10 +19,11 @@ const initialState = {
   cursor: 0,
   sseConnected: false,
 
-  voice: {                      // filled by voice.js (real browser mic state)
+  voice: {                      // filled by voice.js (mic + Cloud Live state)
     mic: "off",                 // off | on | muted | denied | unsupported
     wake: "off",                // off | on | unsupported
-    status: "IDLE",             // IDLE | LISTENING | PROCESSING
+    realtime: "off",            // off | connecting | connected
+    status: "IDLE",             // IDLE | LISTENING | THINKING | SPEAKING | ERROR
     level: 0,
     transcript: "",
   },

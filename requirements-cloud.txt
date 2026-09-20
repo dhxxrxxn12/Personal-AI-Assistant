@@ -1,0 +1,12 @@
+# Production dependencies for the Linux/amd64 JARVIS Cloud process only.
+# The Mac Agent and desktop HUD continue to use requirements.txt locally.
+# Keep versions pinned so image rebuilds resolve the same dependency set.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+google-genai==2.23.0
+python-multipart==0.0.32
+numpy==2.4.6
+psutil==7.2.2
+Pillow==12.3.0
+playwright==1.62.0
+send2trash==2.1.0

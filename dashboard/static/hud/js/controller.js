@@ -66,8 +66,8 @@ function deriveReactor(state) {
     };
   }
 
-  if (state.voice.status === "LISTENING") {
-    return { state: "LISTENING", detail: "microphone open" };
+  if (["LISTENING", "THINKING", "SPEAKING"].includes(state.voice.status)) {
+    return { state: state.voice.status, detail: `voice ${state.voice.status.toLowerCase()}` };
   }
 
   const recent = state.tasks
@@ -88,6 +88,8 @@ export function createController({ voice, onEvent } = {}) {
   const state = store.state;
   let localSeq = 0;
   let streamController = null;
+  let streamReconnectTimer = 0;
+  let streamStopped = false;
   let sseActive = false;
   const stoppables = [];
 
@@ -172,14 +174,18 @@ export function createController({ voice, onEvent } = {}) {
 
   function startActivityStream() {
     if (typeof fetch === "undefined" || typeof ReadableStream === "undefined") return;
-    streamController = new AbortController();
-    const token = authToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    (async () => {
+    streamStopped = false;
+
+    const connect = async () => {
+      if (streamStopped) return;
+      streamController = new AbortController();
+      const controller = streamController;
+      const token = authToken();
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
       try {
         const response = await fetch(api.streamUrl(state.cursor), {
           headers,
-          signal: streamController.signal,
+          signal: controller.signal,
         });
         if (!response.ok || !response.body) throw new Error(`stream ${response.status}`);
         sseActive = true;
@@ -204,8 +210,13 @@ export function createController({ voice, onEvent } = {}) {
       } finally {
         sseActive = false;
         store.set({ sseConnected: false });
+        if (!streamStopped) {
+          streamReconnectTimer = window.setTimeout(connect, 2000);
+        }
       }
-    })();
+    };
+
+    connect();
   }
 
   // ---------------------------------------------------------------- actions
@@ -317,6 +328,9 @@ export function createController({ voice, onEvent } = {}) {
 
   function stop() {
     stoppables.splice(0).forEach((stopPolling) => stopPolling());
+    streamStopped = true;
+    window.clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = 0;
     if (streamController) {
       streamController.abort();
       streamController = null;

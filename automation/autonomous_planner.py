@@ -16,12 +16,14 @@ Responsibilities:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from google import genai
+from google.genai import types
 
 from .autonomous_engine import Task
 from .learning_memory import LearningMemory
@@ -38,6 +40,35 @@ class Plan:
     source: str = "generated"
 
 
+class PlannerError(RuntimeError):
+    """Safe, dashboard-friendly planner failure without provider secrets."""
+
+    def __init__(self, message: str, kind: str = "planner_error") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.public_message = message
+
+
+_PLAN_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "tasks": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "action": {"type": "STRING"},
+                    "parameters": {"type": "OBJECT"},
+                    "description": {"type": "STRING"},
+                },
+                "required": ["action", "parameters"],
+            },
+        },
+    },
+    "required": ["tasks"],
+}
+
+
 # ==============================================================
 # AUTONOMOUS PLANNER
 # ==============================================================
@@ -51,7 +82,7 @@ class AutonomousPlanner:
         logger=print,
         max_steps: int = 20,
         api_key: Optional[str] = None,
-        model: str = "gemini-flash-latest",
+        model: Optional[str] = None,
     ):
         self.action_registry = action_registry
 
@@ -63,7 +94,11 @@ class AutonomousPlanner:
         self.logger = logger
         self.max_steps = max_steps
 
-        self.model = model
+        self.model = (
+            str(model or os.getenv("JARVIS_PLANNER_MODEL", "gemini-flash-latest"))
+            .strip()
+            or "gemini-flash-latest"
+        )
 
         # Fallback models.
         self.fallback_models = [
@@ -404,8 +439,9 @@ Return EXACTLY this structure:
     ):
 
         if self.client is None:
-            raise RuntimeError(
-                "Gemini client is not configured."
+            raise PlannerError(
+                "Gemini credentials are not configured for cloud planning.",
+                "credentials",
             )
 
         models = []
@@ -419,7 +455,7 @@ Return EXACTLY this structure:
             if model_name not in models:
                 models.append(model_name)
 
-        last_error = None
+        last_kind = "api_error"
 
         for model_name in models:
 
@@ -434,11 +470,14 @@ Return EXACTLY this structure:
                         f"(attempt {attempt + 1}/2)"
                     )
 
-                    response = (
-                        self.client.models.generate_content(
-                            model=model_name,
-                            contents=prompt,
-                        )
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=_PLAN_RESPONSE_SCHEMA,
+                            temperature=0,
+                        ),
                     )
 
                     self.logger(
@@ -449,47 +488,58 @@ Return EXACTLY this structure:
                     return response
 
                 except Exception as exc:
-
-                    last_error = exc
-
-                    error_text = str(exc)
-
+                    kind, public_message, retryable = self._classify_provider_error(exc)
+                    last_kind = kind
                     self.logger(
-                        "[Planner] Gemini error: "
-                        f"{error_text}"
+                        "[Planner] Gemini request failed "
+                        f"model={model_name} kind={kind} "
+                        f"exception={type(exc).__name__}"
                     )
 
-                    # Only wait/retry for temporary failures.
-                    if (
-                        "503" in error_text
-                        or "UNAVAILABLE" in error_text
-                        or "429" in error_text
-                        or "RESOURCE_EXHAUSTED" in error_text
-                    ):
+                    if retryable and attempt == 0:
+                        wait_seconds = 2
+                        self.logger(
+                            "[Planner] Temporary Gemini failure; retrying once"
+                        )
+                        time.sleep(wait_seconds)
+                        continue
 
-                        if attempt == 0:
-
-                            wait_seconds = 2
-
-                            self.logger(
-                                "[Planner] Temporary Gemini "
-                                f"failure. Retrying in "
-                                f"{wait_seconds}s..."
-                            )
-
-                            time.sleep(
-                                wait_seconds
-                            )
-
-                            continue
-
-                    # Move to next model.
+                    # Authentication and quota failures are not fixed by
+                    # trying another model.  Stop early and show a useful,
+                    # secret-free state in the HUD.
+                    if kind in {"credentials", "quota"}:
+                        raise PlannerError(public_message, kind) from exc
                     break
 
-        raise RuntimeError(
-            "All Gemini planning models failed. "
-            f"Last error: {last_error}"
-        )
+        messages = {
+            "model_unavailable": "Configured Gemini planning model is unavailable.",
+            "service_unavailable": "Gemini is temporarily unavailable.",
+            "api_error": "Gemini planning request failed.",
+        }
+        raise PlannerError(messages.get(last_kind, "Gemini planning request failed."), last_kind)
+
+    @staticmethod
+    def _classify_provider_error(exc: Exception) -> tuple[str, str, bool]:
+        """Map provider failures to safe, stable messages for operators."""
+        text = str(exc).lower()
+        if any(marker in text for marker in (
+            "401", "403", "unauthenticated", "permission denied",
+            "api key", "authentication", "invalid credential",
+        )):
+            return "credentials", "Gemini credentials were rejected or are missing.", False
+        if any(marker in text for marker in (
+            "429", "quota", "resource_exhausted", "rate limit", "too many requests",
+        )):
+            return "quota", "Gemini quota or rate limit reached.", False
+        if any(marker in text for marker in (
+            "404", "not found", "unknown model", "model is unavailable",
+        )):
+            return "model_unavailable", "Configured Gemini planning model is unavailable.", False
+        if any(marker in text for marker in (
+            "503", "unavailable", "deadline", "timeout", "timed out",
+        )):
+            return "service_unavailable", "Gemini is temporarily unavailable.", True
+        return "api_error", "Gemini planning request failed.", False
 
     # ==========================================================
     # JSON CLEANING
@@ -547,13 +597,15 @@ Return EXACTLY this structure:
     ) -> Plan:
 
         if self.action_registry is None:
-            raise RuntimeError(
-                "ActionRegistry is not attached."
+            raise PlannerError(
+                "Cloud planner is missing its action registry.",
+                "configuration",
             )
 
         if self.client is None:
-            raise RuntimeError(
-                "Gemini client is not configured."
+            raise PlannerError(
+                "Gemini credentials are not configured for cloud planning.",
+                "credentials",
             )
 
         prompt = self._build_prompt(
@@ -571,18 +623,12 @@ Return EXACTLY this structure:
             )
         )
 
-        text = (
-            getattr(
-                response,
-                "text",
-                "",
-            )
-            or ""
-        ).strip()
+        text = self._response_text(response)
 
         if not text:
-            raise RuntimeError(
-                "Gemini returned an empty planning response."
+            raise PlannerError(
+                "Gemini returned no usable planning content.",
+                "empty_response",
             )
 
         text = self._clean_json(
@@ -596,19 +642,18 @@ Return EXACTLY this structure:
             )
 
         except json.JSONDecodeError as exc:
-
-            raise RuntimeError(
-                "Gemini returned invalid JSON: "
-                f"{exc}\n"
-                f"Response: {text[:1000]}"
+            raise PlannerError(
+                "Gemini returned invalid planning JSON.",
+                "invalid_json",
             ) from exc
 
         if not isinstance(
             data,
             dict,
         ):
-            raise RuntimeError(
-                "Gemini response must be a JSON object."
+            raise PlannerError(
+                "Gemini returned an invalid planning object.",
+                "invalid_schema",
             )
 
         raw_tasks = data.get(
@@ -619,9 +664,9 @@ Return EXACTLY this structure:
             raw_tasks,
             list,
         ):
-            raise RuntimeError(
-                "Gemini plan does not contain "
-                "a valid 'tasks' list."
+            raise PlannerError(
+                "Gemini returned an invalid task list.",
+                "invalid_schema",
             )
 
         tasks: List[Task] = []
@@ -632,8 +677,9 @@ Return EXACTLY this structure:
                 item,
                 dict,
             ):
-                raise RuntimeError(
-                    "Invalid task returned by Gemini."
+                raise PlannerError(
+                    "Gemini returned an invalid task.",
+                    "invalid_schema",
                 )
 
             action = item.get(
@@ -654,18 +700,22 @@ Return EXACTLY this structure:
                 action,
                 str,
             ):
-                raise RuntimeError(
-                    "Task action must be a string."
+                raise PlannerError(
+                    "Gemini returned a task without a valid action.",
+                    "invalid_schema",
                 )
 
             if not isinstance(
                 parameters,
                 dict,
             ):
-                raise RuntimeError(
-                    f"Parameters for {action} "
-                    "must be a JSON object."
+                raise PlannerError(
+                    "Gemini returned invalid task parameters.",
+                    "invalid_schema",
                 )
+
+            if not isinstance(description, str):
+                description = ""
 
             tasks.append(
                 Task(
@@ -682,10 +732,13 @@ Return EXACTLY this structure:
         )
 
         if not valid:
-            raise RuntimeError(
-                "Gemini generated an "
-                f"unsafe/invalid plan: {reason}"
+            kind = "empty_plan" if not tasks else "invalid_plan"
+            message = (
+                "Gemini returned an empty plan; no executable tasks were produced."
+                if not tasks
+                else "Gemini returned an unsafe or invalid plan."
             )
+            raise PlannerError(message, kind)
 
         self.logger(
             "[Planner] Generated "
@@ -697,6 +750,42 @@ Return EXACTLY this structure:
             tasks=tasks,
             source="gemini",
         )
+
+    @staticmethod
+    def _response_text(response: Any) -> str:
+        """Read structured or text model output without leaking it in errors."""
+        try:
+            parsed = getattr(response, "parsed", None)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed, ensure_ascii=False)
+
+        try:
+            text = getattr(response, "text", None)
+        except Exception:
+            text = None
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        try:
+            candidates = getattr(response, "candidates", None) or []
+        except Exception:
+            candidates = []
+        for candidate in candidates:
+            try:
+                content = getattr(candidate, "content", None)
+                parts = getattr(content, "parts", None) or []
+            except Exception:
+                continue
+            for part in parts:
+                try:
+                    part_text = getattr(part, "text", None)
+                except Exception:
+                    part_text = None
+                if isinstance(part_text, str) and part_text.strip():
+                    return part_text.strip()
+        return ""
 
     # ==========================================================
     # MAIN PLANNING ENTRY POINT
@@ -857,7 +946,8 @@ Return EXACTLY this structure:
             learned = self.find_learned_plan(goal)
         except Exception as exc:
             self.logger(
-                f"[Planner] Learned workflow lookup failed: {exc}"
+                "[Planner] Learned workflow lookup failed "
+                f"exception={type(exc).__name__}"
             )
 
         if learned and learned.tasks:
@@ -985,13 +1075,12 @@ If the goal is complete, return:
 
         response = self._generate_with_fallback(prompt)
 
-        text = (
-            getattr(response, "text", "") or ""
-        ).strip()
+        text = self._response_text(response)
 
         if not text:
-            raise RuntimeError(
-                "Gemini returned an empty next-action response."
+            raise PlannerError(
+                "Gemini returned no usable next-action content.",
+                "empty_response",
             )
 
         text = self._clean_json(text)
@@ -999,14 +1088,15 @@ If the goal is complete, return:
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Gemini returned invalid next-action JSON: "
-                f"{exc}\nResponse: {text[:1000]}"
+            raise PlannerError(
+                "Gemini returned invalid next-action JSON.",
+                "invalid_json",
             ) from exc
 
         if not isinstance(data, dict):
-            raise RuntimeError(
-                "Gemini next-action response must be a JSON object."
+            raise PlannerError(
+                "Gemini returned an invalid next-action object.",
+                "invalid_schema",
             )
 
         # ------------------------------------------------------
@@ -1037,8 +1127,9 @@ If the goal is complete, return:
         raw_task = data.get("task")
 
         if not isinstance(raw_task, dict):
-            raise RuntimeError(
-                "Gemini did not return a valid next task."
+            raise PlannerError(
+                "Gemini did not return a valid next task.",
+                "invalid_schema",
             )
 
         action = raw_task.get("action")
@@ -1054,15 +1145,19 @@ If the goal is complete, return:
         )
 
         if not isinstance(action, str):
-            raise RuntimeError(
-                "Next task action must be a string."
+            raise PlannerError(
+                "Gemini returned a next task without a valid action.",
+                "invalid_schema",
             )
 
         if not isinstance(parameters, dict):
-            raise RuntimeError(
-                f"Parameters for {action} "
-                "must be a JSON object."
+            raise PlannerError(
+                "Gemini returned invalid next-task parameters.",
+                "invalid_schema",
             )
+
+        if not isinstance(description, str):
+            description = ""
 
         task = Task(
             action=action,
@@ -1079,9 +1174,9 @@ If the goal is complete, return:
         )
 
         if not valid:
-            raise RuntimeError(
-                "Gemini generated an invalid next action: "
-                f"{validation_reason}"
+            raise PlannerError(
+                "Gemini returned an unsafe or invalid next action.",
+                "invalid_plan",
             )
 
         self.logger(
