@@ -73,6 +73,27 @@ export const api = {
   cancelTask: (id) =>
     request(`/tasks/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
 
+  engineeringTasks: () => request("/engineering/tasks"),
+  engineeringDiagnostics: () => request("/engineering/diagnostics"),
+  engineeringTask: (id) => request(`/engineering/tasks/${encodeURIComponent(id)}`),
+  engineeringEvents: (id) => request(`/engineering/tasks/${encodeURIComponent(id)}/events`),
+  createEngineeringTask: (goal, candidatePlan) =>
+    request("/engineering/tasks", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ goal, candidate_plan: candidatePlan || null }),
+    }),
+  approveEngineeringTask: (id) =>
+    request(`/engineering/tasks/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ approved: true }),
+    }),
+  cancelEngineeringTask: (id) =>
+    request(`/engineering/tasks/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  rollbackEngineeringTask: (id) =>
+    request(`/engineering/tasks/${encodeURIComponent(id)}/rollback`, { method: "POST" }),
+
   permission: (id) => request(`/tasks/${encodeURIComponent(id)}/permission`),
   approvePermission: (id, action, parameters) =>
     request(`/tasks/${encodeURIComponent(id)}/permission/approve`, {

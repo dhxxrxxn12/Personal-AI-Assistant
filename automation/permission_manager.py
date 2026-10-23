@@ -34,6 +34,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 import json
+import os
+import tempfile
 
 from core.runtime_config import migrate_legacy_file, runtime_path
 
@@ -83,6 +85,13 @@ class PermissionManager:
         "flight_finder",
         "reminder",
         "file_processor",
+        "read_inbox",
+        "analyze_inbox",
+        "generate_briefing",
+        "social_inspect",
+        "social_analyze",
+        "social_summary",
+        "open_conversation",
     }
 
     # Read-only self-engineering operations are safe by default. Mutating
@@ -112,6 +121,18 @@ class PermissionManager:
         "file_controller",
         "game_updater",
         "send_message",
+        "draft_reply",
+        "send_reply",
+        "delete_message",
+        "post_content",
+        "follow_user",
+        "unfollow_user",
+        "like",
+        "comment",
+        "reply_to_message",
+        "instagram_reply",
+        "social_send",
+        "mark_reviewed",
     }
 
     # ==========================================================
@@ -156,7 +177,10 @@ class PermissionManager:
         path: Path = PERMISSION_FILE,
     ):
 
-        self.path = path
+        if path == PERMISSION_FILE and "PYTEST_CURRENT_TEST" in os.environ:
+            self.path = Path(tempfile.mkdtemp(prefix="jarvis-permissions-")) / "permissions.json"
+        else:
+            self.path = path
 
         self.path.parent.mkdir(
             parents=True,
@@ -236,6 +260,12 @@ class PermissionManager:
             parameters
             or {}
         )
+
+        if action == "call":
+            operation = str(parameters.get("operation", "")).lower()
+            if operation in {"approve", "answer"}:
+                return PermissionLevel.CONFIRM
+            return PermissionLevel.SAFE
 
         # ------------------------------------------------------
         # Infrastructure

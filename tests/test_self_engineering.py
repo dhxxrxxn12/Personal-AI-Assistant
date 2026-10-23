@@ -14,6 +14,7 @@ from automation.self_engineering.capability_analyzer import CapabilityAnalyzer
 from automation.self_engineering.change_memory import ChangeMemory, EngineeringMemoryRecord
 from automation.self_engineering.code_executor import CodeExecutor
 from automation.self_engineering.director import EngineeringDirector
+from automation.self_engineering.diagnostics import collect_diagnostics
 from automation.self_engineering.engineering_planner import EngineeringPlanner, PlanValidationError
 from automation.self_engineering.failure_analyzer import FailureAnalyzer
 from automation.self_engineering.git_manager import GitManager
@@ -178,3 +179,83 @@ def test_director_rejects_provider_plan_and_emits_trace(tmp_path):
     assert run.plan is not None
     assert run.plan.source == "deterministic_fallback"
     assert director.report(run)["snapshot"] is not None
+
+
+def test_director_runs_controlled_lifecycle_in_isolated_worktree(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_app.py").write_text(
+        "from app import VALUE\n\ndef test_value():\n    assert VALUE == 2\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "test: baseline"], cwd=tmp_path, check=True)
+
+    goal = "Improve the diagnostic value"
+    plan = {
+        "goal": goal,
+        "analysis": "The diagnostic module needs one bounded source change and a targeted test.",
+        "steps": [{
+            "id": "change-source",
+            "description": "Update the source value in the isolated worktree.",
+            "operation": "modify_file",
+            "files": ["app.py"],
+            "tests": ["tests/test_app.py"],
+            "risk": "medium",
+            "requires_approval": True,
+        }],
+        "required_approvals": ["approve sandbox implementation and checkpoint"],
+        "verification_plan": ["compile Python files", "run targeted pytest"],
+        "affected_files": ["app.py", "tests/test_app.py"],
+        "proposed_changes": ["Update VALUE in app.py."],
+        "risk": "medium",
+    }
+
+    def implementation(executor, _plan):
+        current = executor.read_source("app.py")
+        executor.modify_file(
+            "app.py",
+            current.replace("VALUE = 1", "VALUE = 2"),
+            expected_sha256=hashlib.sha256(current.encode("utf-8")).hexdigest(),
+            approved=True,
+        )
+
+    task = EngineeringDirector(tmp_path, enabled=True).execute(
+        goal,
+        candidate_plan=plan,
+        approved=True,
+        implementation=implementation,
+    )
+
+    assert task.status == "awaiting_deploy_approval"
+    assert task.repository_inspection and task.capability_analysis
+    assert any(event.stage == "capability_analyzed" for event in task.events)
+    assert task.git_checkpoint and task.git_checkpoint["commit"]
+    assert task.verification_result["success"] is True
+    assert task.production_impact == "pending approval"
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not Path(task.sandbox_path).exists()
+    assert "GIT CHECKPOINT" in task.final_report.upper()
+
+
+def test_diagnostics_reports_version_commit_tests_and_action_count(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("diagnostic fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "test: diagnostic baseline"], cwd=tmp_path, check=True)
+
+    report = collect_diagnostics(
+        tmp_path,
+        action_count=17,
+        test_status={"status": "passed", "checks": 3},
+    ).to_dict()
+
+    assert report["version"] == "1.0.0"
+    assert len(report["git_commit"]) == 40
+    assert report["test_status"] == {"status": "passed", "checks": 3}
+    assert report["active_action_count"] == 17

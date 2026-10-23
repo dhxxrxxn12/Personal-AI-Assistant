@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#050b12">
+  <title>JARVIS // LOCAL COMMAND CENTER</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --void: #050a10;
+      --panel: rgba(8, 19, 30, .88);
+      --panel-deep: rgba(3, 11, 19, .92);
+      --line: rgba(81, 198, 226, .2);
+      --line-strong: rgba(81, 198, 226, .42);
+      --cyan: #6ceaff;
+      --blue: #1599d0;
+      --text: #e2f7fc;
+      --muted: #89a6b4;
+      --dim: #55707f;
+      --green: #71efc0;
+      --amber: #ffc96b;
+      --red: #ff7384;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--void);
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-width: 320px;
+      min-height: 100vh;
+      margin: 0;
+      background:
+        radial-gradient(ellipse at 50% -24%, rgba(9, 110, 150, .2), transparent 56%),
+        linear-gradient(90deg, transparent 49.95%, rgba(64, 172, 204, .035) 50%, transparent 50.05%),
+        repeating-linear-gradient(0deg, transparent 0 47px, rgba(63, 157, 189, .035) 48px),
+        var(--void);
+    }
+    button, textarea { font: inherit; }
+    button { color: inherit; }
+    .shell { width: min(1560px, 100%); margin: auto; padding: 0 28px 30px; }
+    .topbar {
+      min-height: 88px; display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; border-bottom: 1px solid var(--line); position: relative;
+    }
+    .topbar::after {
+      position: absolute; bottom: -1px; left: 0; width: 170px; height: 1px;
+      background: var(--cyan); box-shadow: 0 0 12px var(--cyan); content: "";
+    }
+    .brand { display: flex; align-items: center; gap: 15px; min-width: 0; }
+    .brand-mark {
+      display: grid; place-items: center; width: 48px; height: 48px; flex: 0 0 auto;
+      border: 1px solid var(--cyan); color: var(--cyan); font: 700 1.1rem var(--mono);
+      transform: rotate(45deg); box-shadow: inset 0 0 18px rgba(108, 234, 255, .11), 0 0 19px rgba(108, 234, 255, .12);
+    }
+    .brand-mark span { transform: rotate(-45deg); }
+    h1 { margin: 0; font-size: 1.16rem; letter-spacing: .25em; font-weight: 600; }
+    .eyebrow, .micro-label {
+      margin: 4px 0 0; color: var(--muted); font:  .66rem/1.4 var(--mono);
+      letter-spacing: .13em; text-transform: uppercase;
+    }
+    .connection { display: flex; align-items: center; gap: 10px; text-align: right; }
+    .connection-copy strong { display: block; font: 600 .72rem var(--mono); letter-spacing: .09em; }
+    .connection-copy span { color: var(--muted); font: .62rem var(--mono); }
+    .signal-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 11px currentColor; color: var(--amber); }
+    .signal-dot.good { color: var(--green); background: var(--green); }
+    .signal-dot.bad { color: var(--red); background: var(--red); }
+    .system-strip {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin: 18px 0; border: 1px solid var(--line); background: rgba(5, 15, 24, .78);
+    }
+    .metric { min-width: 0; padding: 11px 16px; border-right: 1px solid var(--line); }
+    .metric:last-child { border-right: 0; }
+    .metric-label { display: block; color: var(--muted); font: .61rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .metric-value { display: block; overflow: hidden; margin-top: 6px; color: var(--text); font: 600 .83rem var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+    .metric-value.good { color: var(--green); }
+    .metric-value.warn { color: var(--amber); }
+    .metric-value.bad { color: var(--red); }
+    .workspace { display: grid; gap: 16px; }
+    .hero-grid { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(360px, .88fr); gap: 16px; }
+    .lower-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(330px, .85fr); gap: 16px; }
+    .panel {
+      min-width: 0; position: relative; overflow: hidden; padding: 18px;
+      border: 1px solid var(--line); background: var(--panel);
+      box-shadow: inset 0 1px rgba(178, 239, 255, .025), 0 14px 38px rgba(0, 0, 0, .18);
+    }
+    .panel::before, .panel::after {
+      position: absolute; width: 13px; height: 13px; pointer-events: none; content: "";
+    }
+    .panel::before { top: -1px; left: -1px; border-top: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
+    .panel::after { right: -1px; bottom: -1px; border-right: 2px solid var(--blue); border-bottom: 2px solid var(--blue); }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+    h2 { margin: 0; color: var(--cyan); font: 600 .7rem var(--mono); letter-spacing: .15em; text-transform: uppercase; }
+    h3 { margin: 0; font-size: .92rem; font-weight: 550; }
+    .panel-code { color: var(--dim); font: .6rem var(--mono); letter-spacing: .08em; }
+    .core-panel {
+      min-height: 420px; display: grid; grid-template-rows: auto 1fr auto;
+      background:
+        linear-gradient(rgba(4, 16, 25, .82), rgba(4, 14, 23, .88)),
+        repeating-linear-gradient(90deg, transparent 0 38px, rgba(87, 183, 210, .05) 39px),
+        repeating-linear-gradient(0deg, transparent 0 38px, rgba(87, 183, 210, .05) 39px);
+    }
+    .core-stage { min-height: 280px; display: grid; place-items: center; position: relative; }
+    .core-crosshair {
+      position: absolute; inset: 50% auto auto 50%; width: min(72%, 330px); aspect-ratio: 1;
+      transform: translate(-50%, -50%);
+      background:
+        linear-gradient(transparent calc(50% - .5px), rgba(84, 202, 230, .13) 50%, transparent calc(50% + .5px)),
+        linear-gradient(90deg, transparent calc(50% - .5px), rgba(84, 202, 230, .13) 50%, transparent calc(50% + .5px));
+      border-radius: 50%;
+    }
+    .core-ring {
+      position: absolute; top: 50%; left: 50%; width: min(68vw, 274px); max-width: 77%;
+      aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%);
+      border: 1px solid rgba(108, 234, 255, .2);
+      background: radial-gradient(circle, rgba(18, 141, 188, .11), transparent 62%);
+      box-shadow: 0 0 38px rgba(18, 169, 218, .1), inset 0 0 32px rgba(18, 169, 218, .08);
+      transition: border-color .45s ease, box-shadow .45s ease, filter .45s ease;
+    }
+    .core-ring::before, .core-ring::after {
+      position: absolute; inset: 12px; border: 1px dashed rgba(108, 234, 255, .34);
+      border-radius: 50%; content: "";
+    }
+    .core-ring::after {
+      inset: 27px; border: 0; border-top: 2px solid var(--cyan);
+      border-bottom: 1px solid rgba(21, 153, 208, .45);
+      filter: drop-shadow(0 0 6px rgba(108, 234, 255, .8));
+      animation: orbit 12s linear infinite;
+    }
+    .core-ring[data-state="EXECUTING"] { border-color: rgba(108, 234, 255, .72); box-shadow: 0 0 52px rgba(18, 169, 218, .28), inset 0 0 44px rgba(18, 169, 218, .18); }
+    .core-ring[data-state="WAITING FOR APPROVAL"] { border-color: var(--amber); box-shadow: 0 0 38px rgba(255, 201, 107, .2), inset 0 0 34px rgba(255, 201, 107, .11); }
+    .core-ring[data-state="ERROR"], .core-ring[data-state="WARNING"], .core-ring[data-state="OFFLINE"] { border-color: var(--red); box-shadow: 0 0 36px rgba(255, 115, 132, .18), inset 0 0 28px rgba(255, 115, 132, .1); }
+    .core-ring[data-state="COMPLETED"] { border-color: var(--green); box-shadow: 0 0 38px rgba(113, 239, 192, .18), inset 0 0 29px rgba(113, 239, 192, .1); }
+    .core-ring[data-state="EXECUTING"]::after { animation-duration: 3.8s; }
+    .core-center { position: relative; z-index: 1; text-align: center; }
+    .core-center strong { display: block; font-size: 1.25rem; letter-spacing: .28em; text-indent: .28em; }
+    .core-center span { display: block; margin-top: 8px; color: var(--cyan); font: .65rem var(--mono); letter-spacing: .16em; }
+    .core-readout {
+      position: absolute; top: 50%; width: 100%; display: flex; justify-content: space-between;
+      color: var(--dim); font: .58rem var(--mono); letter-spacing: .08em; pointer-events: none;
+    }
+    .core-status { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 12px; }
+    .state-label { display: block; color: var(--muted); font: .61rem var(--mono); letter-spacing: .12em; }
+    .state-value { display: block; margin-top: 4px; font: 600 .9rem var(--mono); letter-spacing: .07em; }
+    .core-task { max-width: 62%; overflow: hidden; color: var(--muted); font: .7rem var(--mono); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+    .voice-wave {
+      height: 38px; display: flex; align-items: center; justify-content: center; gap: 4px;
+      margin-top: 13px; border-top: 1px solid rgba(81, 198, 226, .12);
+    }
+    .wave-bar { width: 3px; height: 4px; background: rgba(108, 234, 255, .48); transform-origin: center; }
+    .voice-wave[data-active="true"] .wave-bar { animation: pulse 1s ease-in-out infinite alternate; }
+    .wave-bar:nth-child(3n) { animation-delay: -.35s; }
+    .wave-bar:nth-child(4n) { animation-delay: -.62s; }
+    .wave-label { color: var(--dim); font: .55rem var(--mono); letter-spacing: .08em; text-align: center; }
+    .command-panel { display: flex; flex-direction: column; min-height: 420px; }
+    .command-intro { max-width: 440px; margin: 8px 0 22px; color: var(--muted); font-size: .85rem; }
+    .command-form { display: grid; gap: 10px; margin-top: auto; }
+    .command-label { color: var(--muted); font: .63rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    textarea {
+      width: 100%; min-height: 132px; resize: vertical; padding: 14px;
+      color: var(--text); background: var(--panel-deep); border: 1px solid var(--line-strong);
+      border-radius: 0; outline: none; line-height: 1.55;
+    }
+    textarea::placeholder { color: #58717d; }
+    textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(108, 234, 255, .13); }
+    .command-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .command-hint { color: var(--dim); font: .6rem var(--mono); }
+    button {
+      min-height: 42px; padding: 0 18px; border: 1px solid var(--cyan);
+      color: #051018; background: var(--cyan); font: 700 .7rem var(--mono);
+      letter-spacing: .11em; text-transform: uppercase; cursor: pointer;
+      clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+      transition: filter .18s ease, transform .18s ease, opacity .18s ease;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.16); transform: translateY(-1px); }
+    button:focus-visible { outline: 2px solid white; outline-offset: 3px; }
+    button:disabled { cursor: not-allowed; opacity: .48; }
+    button.secondary { color: var(--text); background: transparent; border-color: var(--line-strong); }
+    button.deny { color: var(--red); border-color: rgba(255, 115, 132, .55); }
+    .alert { min-height: 1.4em; margin: 2px 0 0; color: var(--red); font-size: .76rem; }
+    .panel-grid { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr); gap: 16px; }
+    .list { display: grid; align-content: start; gap: 9px; }
+    .empty { padding: 14px 0; color: var(--muted); font-size: .8rem; }
+    .task, .approval, .event, .summary-item {
+      min-width: 0; padding: 12px; border: 1px solid rgba(81, 198, 226, .14);
+      background: rgba(3, 11, 19, .64);
+    }
+    .task-top, .approval-actions, .task-info { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .task-goal { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: .82rem; }
+    .badge {
+      flex: 0 0 auto; padding: 4px 7px; border: 1px solid var(--line);
+      color: var(--muted); font: .58rem var(--mono); letter-spacing: .05em;
+    }
+    .badge.good { color: var(--green); border-color: rgba(113, 239, 192, .36); }
+    .badge.warn { color: var(--amber); border-color: rgba(255, 201, 107, .4); }
+    .badge.bad { color: var(--red); border-color: rgba(255, 115, 132, .4); }
+    .task-info { margin-top: 8px; color: var(--muted); font: .62rem var(--mono); flex-wrap: wrap; }
+    .progress-track { height: 3px; margin: 10px 0 8px; background: rgba(137, 166, 180, .16); }
+    .progress-fill { height: 100%; background: var(--cyan); transition: width .35s ease; }
+    .steps { display: grid; gap: 5px; margin-top: 10px; }
+    .step { display: grid; grid-template-columns: 1fr auto; gap: 12px; color: var(--muted); font: .64rem var(--mono); }
+    .step span:first-child { overflow-wrap: anywhere; }
+    .approval { border-left: 2px solid var(--amber); }
+    .approval p { margin: 7px 0 11px; color: var(--muted); font-size: .76rem; }
+    .approval-actions { justify-content: flex-start; }
+    .approval-actions button { min-height: 34px; padding: 0 12px; font-size: .62rem; }
+    pre {
+      max-height: 180px; margin: 9px 0 0; overflow: auto; white-space: pre-wrap;
+      overflow-wrap: anywhere; color: #b4d3df; font: .66rem/1.5 var(--mono);
+    }
+    .event { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 5px 10px; }
+    .event-category { color: var(--cyan); font: 600 .59rem var(--mono); letter-spacing: .08em; }
+    .event-message { overflow-wrap: anywhere; font-size: .76rem; }
+    .event-time { grid-column: 2; color: var(--muted); font: .59rem var(--mono); }
+    .event.warn .event-category { color: var(--amber); }
+    .event.error .event-category { color: var(--red); }
+    .summary-item h3 { font-size: .78rem; }
+    .summary-meta { margin-top: 5px; color: var(--muted); font: .61rem var(--mono); }
+    .summary-item p { margin: 8px 0 0; color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
+    .lower-grid > .panel { min-height: 180px; }
+    .panel-actions { display: flex; align-items: center; gap: 8px; }
+    .panel-count { color: var(--muted); font: .6rem var(--mono); }
+    .stale { color: var(--amber); }
+    .offline-banner {
+      display: none; margin: 12px 0 0; padding: 10px 12px; color: var(--red);
+      border: 1px solid rgba(255, 115, 132, .34); background: rgba(66, 14, 28, .24);
+      font: .7rem/1.5 var(--mono);
+    }
+    .offline-banner.visible { display: block; }
+    footer { display: flex; justify-content: space-between; gap: 12px; padding: 16px 2px 0; color: var(--dim); font: .6rem var(--mono); }
+    @keyframes orbit { to { transform: rotate(360deg); } }
+    @keyframes pulse { from { transform: scaleY(.35); opacity: .35; } to { transform: scaleY(1.5); opacity: 1; } }
+    @media (max-width: 980px) {
+      .hero-grid, .lower-grid { grid-template-columns: 1fr; }
+      .core-panel, .command-panel { min-height: 390px; }
+      .panel-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 620px) {
+      .shell { padding: 0 13px 20px; }
+      .topbar { min-height: 74px; gap: 12px; }
+      .brand { gap: 11px; }
+      .brand-mark { width: 38px; height: 38px; }
+      h1 { font-size: .96rem; }
+      .eyebrow { font-size: .54rem; letter-spacing: .1em; }
+      .connection { gap: 7px; }
+      .connection-copy strong { font-size: .5rem; letter-spacing: .02em; white-space: nowrap; }
+      .connection-copy span { display: none; }
+      .system-strip { grid-template-columns: 1fr 1fr; margin: 12px 0; }
+      .metric { padding: 9px 11px; }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .workspace, .hero-grid, .lower-grid { gap: 11px; }
+      .panel { padding: 14px; }
+      .panel-grid { grid-template-columns: 1fr; }
+      .core-panel { min-height: 360px; }
+      .core-stage { min-height: 245px; }
+      .core-readout { top: 8px; font-size: .56rem; }
+      .core-ring { width: min(70vw, 250px); }
+      .core-status { grid-template-columns: 1fr; gap: 5px; }
+      .core-task { max-width: 100%; text-align: left; white-space: normal; }
+      .command-panel { min-height: 350px; }
+      .command-intro { margin: 5px 0 15px; }
+      .task-top { flex-wrap: wrap; }
+      footer { flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span>J</span></div>
+        <div>
+          <h1>JARVIS</h1>
+          <p class="eyebrow">MARK LIII <span aria-hidden="true">/</span> LOCAL COMMAND CENTER</p>
+        </div>
+      </div>
+      <div class="connection" role="status" aria-live="polite">
+        <span class="signal-dot" id="connectionDot" aria-hidden="true"></span>
+        <div class="connection-copy">
+          <strong id="connectionState">CONNECTING</strong>
+          <span id="connectionDetail">LOCAL RUNTIME LINK</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="system-strip" aria-label="System status">
+      <div class="metric"><span class="metric-label">Runtime</span><strong class="metric-value" id="runtimeMetric">—</strong></div>
+      <div class="metric"><span class="metric-label">Available actions</span><strong class="metric-value" id="actionMetric">—</strong></div>
+      <div class="metric"><span class="metric-label">Approvals pending</span><strong class="metric-value" id="approvalMetric">—</strong></div>
+      <div class="metric"><span class="metric-label">Last backend sync</span><strong class="metric-value" id="syncMetric">Waiting</strong></div>
+    </div>
+    <div class="offline-banner" id="offlineBanner" role="alert"></div>
+
+    <main class="workspace">
+      <div class="hero-grid">
+        <section class="panel core-panel" aria-labelledby="coreTitle">
+          <div class="panel-head">
+            <h2 id="coreTitle">Command environment</h2>
+            <span class="panel-code">RUNTIME TELEMETRY // LOCAL</span>
+          </div>
+          <div class="core-stage" aria-hidden="true">
+            <div class="core-crosshair"></div>
+            <div class="core-ring" id="coreRing" data-state="OFFLINE"></div>
+            <div class="core-center">
+              <strong>JARVIS</strong>
+              <span id="coreState">CONNECTING</span>
+            </div>
+            <div class="core-readout"><span>SYS / 01</span><span id="coreTaskRef">NO ACTIVE TASK</span></div>
+          </div>
+          <div>
+            <div class="core-status">
+              <div><span class="state-label">OBSERVED APPLICATION STATE</span><strong class="state-value" id="runtimeState">CONNECTING</strong></div>
+              <span class="core-task" id="currentTask">No active runtime task</span>
+            </div>
+            <div class="voice-wave" id="runtimeWave" data-active="false" aria-hidden="true"></div>
+            <p class="wave-label">RUNTIME ACTIVITY INDICATOR // NOT MICROPHONE INPUT</p>
+          </div>
+        </section>
+
+        <section class="panel command-panel" aria-labelledby="commandTitle">
+          <div class="panel-head">
+            <h2 id="commandTitle">Mission input</h2>
+            <span class="panel-code">AUTONOMOUS RUNTIME</span>
+          </div>
+          <p class="command-intro">Submit a goal to the local runtime. Execution and approvals remain governed by JARVIS permissions.</p>
+          <form class="command-form" id="goalForm">
+            <label class="command-label" for="goalInput">Command / objective</label>
+            <textarea id="goalInput" maxlength="2000" required aria-describedby="commandHint commandError" placeholder="Describe the outcome you want…"></textarea>
+            <div class="command-actions">
+              <span class="command-hint" id="commandHint">ENTER TO SUBMIT · SHIFT+ENTER FOR NEW LINE</span>
+              <button id="submitButton" type="submit" disabled>Submit goal</button>
+            </div>
+            <p class="alert" id="commandError" role="alert" aria-live="polite"></p>
+          </form>
+        </section>
+      </div>
+
+      <div class="lower-grid">
+        <section class="panel" aria-labelledby="missionsTitle">
+          <div class="panel-head">
+            <h2 id="missionsTitle">Mission log</h2>
+            <div class="panel-actions"><span class="panel-count" id="taskCount">0 tasks</span><span class="panel-code">TASK STATE</span></div>
+          </div>
+          <div class="list" id="taskList" aria-live="polite" aria-busy="true"><div class="empty">Loading runtime tasks…</div></div>
+        </section>
+        <section class="panel" aria-labelledby="approvalTitle">
+          <div class="panel-head">
+            <h2 id="approvalTitle">Authorization queue</h2>
+            <span class="panel-code">USER DECISION REQUIRED</span>
+          </div>
+          <div class="list" id="approvalList" aria-live="polite" aria-busy="true"><div class="empty">Loading permission requests…</div></div>
+        </section>
+      </div>
+
+      <div class="lower-grid">
+        <section class="panel" aria-labelledby="activityTitle">
+          <div class="panel-head"><h2 id="activityTitle">Activity / recovery</h2><span class="panel-code">LOCAL EVENT STREAM</span></div>
+          <div class="list" id="activityList" aria-live="polite" aria-busy="true"><div class="empty">Loading runtime events…</div></div>
+        </section>
+        <div class="panel-grid">
+          <section class="panel" aria-labelledby="briefingTitle">
+            <div class="panel-head"><h2 id="briefingTitle">Briefings</h2><span class="panel-code">STORED RECORDS</span></div>
+            <div class="list" id="briefingList" aria-live="polite" aria-busy="true"><div class="empty">Loading local briefing records…</div></div>
+          </section>
+          <section class="panel" aria-labelledby="reminderTitle">
+            <div class="panel-head"><h2 id="reminderTitle">Reminders</h2><span class="panel-code">LOCAL LEDGER</span></div>
+            <div class="list" id="reminderList" aria-live="polite" aria-busy="true"><div class="empty">Loading local reminders…</div></div>
+          </section>
+          <section class="panel" aria-labelledby="notificationTitle">
+            <div class="panel-head"><h2 id="notificationTitle">Proactive notifications</h2><span class="panel-code">VOICE LIFECYCLE</span></div>
+            <div class="list" id="notificationList" aria-live="polite" aria-busy="true"><div class="empty">Loading proactive notifications…</div></div>
+          </section>
+          <section class="panel" aria-labelledby="callTitle">
+            <div class="panel-head"><h2 id="callTitle">Simulated calls</h2><span class="panel-code">LOCAL HISTORY</span></div>
+            <div class="list" id="callList" aria-live="polite" aria-busy="true"><div class="empty">Loading simulated call history…</div></div>
+          </section>
+          <section class="panel" aria-labelledby="audioTitle">
+            <div class="panel-head"><h2 id="audioTitle">Audio ownership</h2><span class="panel-code">LOCAL HEALTH</span></div>
+            <div class="list" id="audioStatus" aria-live="polite" aria-busy="true"><div class="empty">Loading audio ownership…</div></div>
+          </section>
+          <section class="panel" aria-labelledby="socialTitle">
+            <div class="panel-head"><h2 id="socialTitle">Social summary</h2><span class="panel-code">CACHED RUNTIME DATA</span></div>
+            <div class="list" id="socialSummary" aria-live="polite" aria-busy="true"><div class="empty">Loading available local summary…</div></div>
+          </section>
+        </div>
+      </div>
+    </main>
+    <footer>
+      <span>LOCAL INTERFACE · 127.0.0.1 · NO REMOTE TELEMETRY</span>
+      <span id="footerState">Awaiting backend status</span>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+      const byId = (id) => document.getElementById(id);
+      const signatures = new Map();
+      const text = (node, value) => { node.textContent = value == null ? "" : String(value); };
+      const make = (tag, className, value) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (value !== undefined) text(node, value);
+        return node;
+      };
+      const pretty = (value) => {
+        if (typeof value === "string") return value;
+        if (value == null) return "";
+        try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+      };
+      const stateClass = (status) => {
+        if (["COMPLETED", "SUCCESS", "READY"].includes(status)) return "good";
+        if (["FAILED", "BLOCKED", "CANCELLED", "ERROR", "OFFLINE"].includes(status)) return "bad";
+        if (["AWAITING_PERMISSION", "AWAITING_USER_DECISION", "RUNNING", "RECOVERING", "NEEDS_CLARIFICATION", "WARNING"].includes(status)) return "warn";
+        return "";
+      };
+      const safeDate = (value) => {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? "Time unavailable" : date.toLocaleString();
+      };
+      const replaceIfChanged = (id, source, render) => {
+        const signature = JSON.stringify(source);
+        if (signatures.get(id) === signature) return;
+        signatures.set(id, signature);
+        const root = byId(id);
+        root.replaceChildren();
+        render(root);
+      };
+
+      async function api(path, options = {}) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        let response;
+        try {
+          response = await fetch(path, {
+            ...options,
+            signal: controller.signal,
+            headers: { ...(options.headers || {}) },
+          });
+        } catch (error) {
+          if (controller.signal.aborted) throw new Error("The local service request timed out.");
+          throw new Error("Cannot reach the local command center.");
+        } finally {
+          clearTimeout(timeout);
+        }
+        let body;
+        try { body = await response.json(); }
+        catch { throw new Error("The local service returned an unreadable response."); }
+        if (!response.ok) throw new Error(body.detail || body.error || `Request failed (${response.status}).`);
+        return body;
+      }
+
+      function setCoreState(state, activeTask) {
+        const ring = byId("coreRing");
+        const visualState = state === "AWAITING_PERMISSION" ? "WAITING FOR APPROVAL" : state;
+        ring.dataset.state = visualState;
+        text(byId("coreState"), visualState);
+        text(byId("runtimeState"), visualState);
+        byId("runtimeWave").dataset.active = state === "EXECUTING" ? "true" : "false";
+        const taskGoal = activeTask && activeTask.goal;
+        text(byId("currentTask"), taskGoal || "No active runtime task");
+        text(byId("coreTaskRef"), activeTask ? `TASK / ${String(activeTask.task_id).slice(0, 8)}` : "NO ACTIVE TASK");
+      }
+
+      function renderTasks(tasks) {
+        replaceIfChanged("taskList", tasks, (root) => {
+          text(byId("taskCount"), `${tasks.length} mission${tasks.length === 1 ? "" : "s"}`);
+          if (!tasks.length) {
+            root.append(make("div", "empty", "No runtime tasks have been recorded."));
+            return;
+          }
+          for (const task of tasks) {
+            const card = make("article", "task");
+            const top = make("div", "task-top");
+            top.append(make("p", "task-goal", task.goal || "Goal text unavailable"));
+            top.append(make("span", `badge ${stateClass(task.status)}`, task.status || "UNKNOWN"));
+            card.append(top);
+            const info = make("div", "task-info");
+            info.append(make("span", "", `ID ${String(task.task_id || "—").slice(0, 12)}`));
+            info.append(make("time", "", safeDate(task.updated_at || task.created_at)));
+            card.append(info);
+            const progress = task.progress || {};
+            if (Number(progress.total) > 0) {
+              card.append(make("div", "task-info", `${Number(progress.completed) || 0} / ${Number(progress.total)} verified steps`));
+              const track = make("div", "progress-track");
+              const fill = make("div", "progress-fill");
+              const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+              fill.style.width = `${percent}%`;
+              track.append(fill);
+              card.append(track);
+            }
+            if (progress.current_step) card.append(make("div", "task-info", `CURRENT · ${progress.current_step}`));
+            if (Array.isArray(task.steps) && task.steps.length) {
+              const steps = make("div", "steps");
+              for (const step of task.steps) {
+                const row = make("div", "step");
+                row.append(make("span", "", step.description || step.step_id || "Runtime step"));
+                row.append(make("span", `badge ${stateClass(step.status)}`, step.status || "PENDING"));
+                steps.append(row);
+              }
+              card.append(steps);
+            }
+            if (task.error) card.append(make("p", "alert", task.error));
+            if (task.outcome && !["RUNNING", "QUEUED", "APPROVAL_PROCESSING"].includes(task.status)) {
+              card.append(make("pre", "", pretty(task.outcome)));
+            }
+            root.append(card);
+          }
+        });
+      }
+
+      function renderApprovals(tasks) {
+        const approvals = [];
+        for (const task of tasks) {
+          for (const approval of task.approvals || []) approvals.push({ task, approval });
+        }
+        replaceIfChanged("approvalList", approvals.map(({ task, approval }) => ({
+          id: task.task_id, status: task.status, approval,
+        })), (root) => {
+          if (!approvals.length) {
+            root.append(make("div", "empty", "No pending runtime approvals."));
+            return;
+          }
+          for (const { task, approval } of approvals) {
+            const card = make("article", "approval");
+            card.append(make("h3", "", approval.action || "Protected action"));
+            card.append(make("p", "", `${approval.description || "Runtime permission required."}${approval.reason ? ` — ${approval.reason}` : ""}`));
+            card.append(make("p", "summary-meta", `TASK ${String(task.task_id).slice(0, 12)} · ${task.goal || ""}`));
+            const actions = make("div", "approval-actions");
+            for (const [label, approved, className] of [
+              ["Approve", true, ""], ["Deny", false, "secondary deny"],
+            ]) {
+              const button = make("button", className, label);
+              button.type = "button";
+              button.setAttribute("aria-label", `${label} ${approval.action || "protected action"}`);
+              button.addEventListener("click", async () => {
+                actions.querySelectorAll("button").forEach((item) => { item.disabled = true; });
+                text(byId("commandError"), "");
+                try {
+                  await api(`/api/tasks/${encodeURIComponent(task.task_id)}/approval`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ approved }),
+                  });
+                  await refresh();
+                } catch (error) {
+                  text(byId("commandError"), error.message);
+                  actions.querySelectorAll("button").forEach((item) => { item.disabled = false; });
+                }
+              });
+              actions.append(button);
+            }
+            card.append(actions);
+            root.append(card);
+          }
+        });
+      }
+
+      function renderActivity(events) {
+        replaceIfChanged("activityList", events, (root) => {
+          if (!events.length) {
+            root.append(make("div", "empty", "No activity events recorded yet."));
+            return;
+          }
+          for (const event of [...events].reverse()) {
+            const level = event.level === "error" ? "error" : event.level === "warn" ? "warn" : "";
+            const item = make("article", `event ${level}`);
+            item.append(make("span", "event-category", event.category || "EVENT"));
+            item.append(make("span", "event-message", event.message || "Runtime event"));
+            item.append(make("time", "event-time", safeDate(event.at)));
+            root.append(item);
+          }
+        });
+      }
+
+      function renderBriefings(records) {
+        replaceIfChanged("briefingList", records, (root) => {
+          if (!records.length) {
+            root.append(make("div", "empty", "No stored local briefing runs."));
+            return;
+          }
+          for (const record of [...records].reverse()) {
+            const item = make("article", "summary-item");
+            item.append(make("h3", "", record.definition_id || "Briefing record"));
+            item.append(make("div", "summary-meta", `${record.status || "RECORDED"} · ${safeDate(record.executed_at || record.scheduled_for)}`));
+            if (record.detail) item.append(make("p", "", record.detail));
+            root.append(item);
+          }
+        });
+      }
+
+      function renderReminders(records) {
+        replaceIfChanged("reminderList", records, (root) => {
+          if (!records.length) {
+            root.append(make("div", "empty", "No active local reminders."));
+            return;
+          }
+          for (const record of records) {
+            const item = make("article", "summary-item");
+            item.append(make("h3", "", record.message || "Reminder"));
+            item.append(make("div", "summary-meta", `${record.status || "SCHEDULED"} · ${safeDate(record.next_due)}${record.recurrence ? ` · ${record.recurrence}` : ""}`));
+            root.append(item);
+          }
+        });
+      }
+
+      function renderNotifications(records) {
+        replaceIfChanged("notificationList", records, (root) => {
+          if (!records.length) {
+            root.append(make("div", "empty", "No proactive notifications yet."));
+            return;
+          }
+          for (const record of records) {
+            const item = make("article", "summary-item");
+            item.append(make("h3", "", record.kind || "Notification"));
+            item.append(make("div", "summary-meta", `${record.status || "QUEUED"} · ${safeDate(record.updated_at)}`));
+            item.append(make("p", "", record.text || ""));
+            root.append(item);
+          }
+        });
+      }
+
+      function renderCalls(records) {
+        replaceIfChanged("callList", records, (root) => {
+          if (!records.length) { root.append(make("div", "empty", "No simulated calls recorded.")); return; }
+          for (const record of records) {
+            const item = make("article", "summary-item");
+            item.append(make("h3", "", `${record.direction || "call"} · ${record.destination || "unknown"}`));
+            item.append(make("div", "summary-meta", `${record.state || "unknown"} · ${safeDate(record.updated_at)}`));
+            item.append(make("p", "", `Purpose: ${record.purpose || "not specified"}`));
+            root.append(item);
+          }
+        });
+      }
+
+      function renderSocial(summary) {
+        replaceIfChanged("socialSummary", summary, (root) => {
+          if (!summary) {
+            root.append(make("div", "empty", "No cached social summary is available."));
+            return;
+          }
+          root.append(make("pre", "", pretty(summary)));
+        });
+      }
+
+      function renderAudio(audio) {
+        replaceIfChanged("audioStatus", audio, (root) => {
+          const state = audio?.state || "UNAVAILABLE";
+          const healthy = audio?.healthy !== false;
+          root.append(make("div", `summary-item ${healthy ? "" : "warning"}`, `State: ${state}`));
+          root.append(make("div", "summary-meta", `Owner: ${audio?.owner || "none"} · ${audio?.enabled ? "gate enabled" : "gate disabled"}`));
+          if (audio?.restoration_failed) root.append(make("p", "", "Gemini restoration is not confirmed."));
+        });
+      }
+
+      let refreshing = false;
+      let submitting = false;
+      let timer = 0;
+      let failures = 0;
+      let online = false;
+      const wave = byId("runtimeWave");
+      for (let index = 0; index < 29; index += 1) wave.append(make("span", "wave-bar"));
+
+      function markOffline(error) {
+        online = false;
+        failures += 1;
+        byId("connectionDot").className = "signal-dot bad";
+        text(byId("connectionState"), "LINK OFFLINE");
+        text(byId("connectionDetail"), "LOCAL RUNTIME UNREACHABLE");
+        text(byId("runtimeMetric"), "OFFLINE");
+        byId("runtimeMetric").className = "metric-value bad";
+        text(byId("actionMetric"), "—");
+        text(byId("approvalMetric"), "—");
+        text(byId("syncMetric"), "STALE");
+        byId("syncMetric").className = "metric-value warn";
+        byId("submitButton").disabled = true;
+        byId("offlineBanner").classList.add("visible");
+        text(byId("offlineBanner"), `${error.message} Retrying automatically; runtime data below is cleared until refreshed.`);
+        text(byId("coreState"), "OFFLINE");
+        text(byId("runtimeState"), "OFFLINE");
+        byId("coreRing").dataset.state = "OFFLINE";
+        byId("runtimeWave").dataset.active = "false";
+        text(byId("currentTask"), "No live task status while offline");
+        text(byId("coreTaskRef"), "LINK LOST");
+        for (const id of ["taskList", "approvalList", "activityList", "briefingList", "reminderList", "notificationList", "callList", "socialSummary"]) {
+          signatures.delete(id);
+          byId(id).replaceChildren(make("div", "empty", "Live data unavailable while disconnected."));
+          byId(id).setAttribute("aria-busy", "false");
+        }
+        text(byId("footerState"), online ? "Connected" : "Disconnected");
+      }
+
+      async function refresh() {
+        if (refreshing || document.hidden) return;
+        refreshing = true;
+        for (const id of ["taskList", "approvalList", "activityList", "briefingList", "reminderList", "notificationList", "callList", "socialSummary"]) {
+          byId(id).setAttribute("aria-busy", "true");
+        }
+        try {
+          const [status, taskResult, activity] = await Promise.all([
+            api("/api/status"), api("/api/tasks"), api("/api/activity?limit=100"),
+          ]);
+          const tasks = Array.isArray(taskResult.tasks) ? taskResult.tasks : [];
+          const activeTask = status.active_task_id
+            ? tasks.find((task) => task.task_id === status.active_task_id)
+            : null;
+          const rawState = String(activeTask?.status || status.runtime_state || "IDLE").toUpperCase();
+          const state = activeTask?.status === "AWAITING_PERMISSION"
+            ? "AWAITING_PERMISSION"
+            : ["RUNNING", "RECOVERING", "APPROVAL_PROCESSING", "QUEUED"].includes(rawState)
+              ? "EXECUTING"
+              : status.ready ? rawState : "ERROR";
+          online = true;
+          failures = 0;
+          byId("connectionDot").className = `signal-dot ${status.ready ? "good" : "bad"}`;
+          text(byId("connectionState"), status.ready ? "LOCAL LINK READY" : "RUNTIME UNAVAILABLE");
+          text(byId("connectionDetail"), status.local_only ? `LOOPBACK · ${status.host || "LOCAL"}` : "LOCALITY NOT CONFIRMED");
+          text(byId("runtimeMetric"), status.ready ? (status.runtime_state || "IDLE") : "UNAVAILABLE");
+          byId("runtimeMetric").className = `metric-value ${status.ready ? "good" : "bad"}`;
+          text(byId("actionMetric"), status.registered_actions ?? "—");
+          text(byId("approvalMetric"), status.approvals_pending ?? 0);
+          byId("approvalMetric").className = `metric-value ${Number(status.approvals_pending) ? "warn" : ""}`;
+          text(byId("syncMetric"), new Date().toLocaleTimeString());
+          byId("syncMetric").className = "metric-value good";
+          byId("submitButton").disabled = !status.ready || submitting;
+          text(byId("offlineBanner"), status.error || "");
+          byId("offlineBanner").classList.toggle("visible", Boolean(status.error));
+          text(byId("footerState"), status.local_only ? "Loopback runtime · live data" : "Backend locality not confirmed");
+          setCoreState(status.ready ? state : "ERROR", activeTask);
+          renderTasks(tasks);
+          renderApprovals(tasks);
+          renderActivity(Array.isArray(activity.events) ? activity.events : []);
+          renderBriefings(Array.isArray(status.briefings) ? status.briefings : []);
+          renderReminders(Array.isArray(status.reminders) ? status.reminders : []);
+          renderNotifications(Array.isArray(status.proactive_notifications) ? status.proactive_notifications : []);
+          renderCalls(Array.isArray(status.calls) ? status.calls : []);
+          renderAudio(status.audio || {});
+          renderSocial(status.social_summary);
+        } catch (error) {
+          markOffline(error);
+        } finally {
+          for (const id of ["taskList", "approvalList", "activityList", "briefingList", "reminderList", "notificationList", "callList", "audioStatus", "socialSummary"]) {
+            byId(id).setAttribute("aria-busy", "false");
+          }
+          refreshing = false;
+          scheduleRefresh();
+        }
+      }
+
+      function scheduleRefresh() {
+        clearTimeout(timer);
+        if (document.hidden) return;
+        const delay = online ? 1800 : Math.min(30000, 1500 * (2 ** Math.min(failures, 4)));
+        timer = setTimeout(refresh, delay);
+      }
+
+      byId("goalForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (submitting) return;
+        const goal = byId("goalInput").value.trim();
+        text(byId("commandError"), "");
+        if (!goal) {
+          text(byId("commandError"), "Enter a goal before submitting.");
+          return;
+        }
+        submitting = true;
+        byId("submitButton").disabled = true;
+        byId("submitButton").textContent = "Submitting…";
+        try {
+          const requestId = crypto.randomUUID();
+          await api("/api/goals", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Idempotency-Key": requestId },
+            body: JSON.stringify({ goal }),
+          });
+          byId("goalInput").value = "";
+          await refresh();
+        } catch (error) {
+          text(byId("commandError"), error.message);
+        } finally {
+          submitting = false;
+          byId("submitButton").textContent = "Submit goal";
+          byId("submitButton").disabled = !online;
+          scheduleRefresh();
+        }
+      });
+
+      byId("goalInput").addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          byId("goalForm").requestSubmit();
+        }
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        clearTimeout(timer);
+        if (!document.hidden) refresh();
+      });
+      refresh();
+    })();
+  </script>
+</body>
+</html>

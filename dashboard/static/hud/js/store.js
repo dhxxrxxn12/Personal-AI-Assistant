@@ -13,6 +13,7 @@ const initialState = {
   systemStatus: null,           // GET /system/status
   devices: [],                  // GET /devices
   tasks: [],                    // GET /tasks
+  engineeringTasks: [],        // GET /engineering/tasks
   counts: {},                   // task status histogram
   files: [],                    // GET /files
   events: [],                   // activity feed (from SSE or GET /activity)

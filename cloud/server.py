@@ -19,14 +19,24 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.action_loader import discover_actions
-from core.runtime_config import migrate_legacy_file
+from core.runtime_config import migrate_legacy_file, runtime_path
 from automation.autonomous_engine import AutonomousEngine
 from automation.autonomous_planner import AutonomousPlanner, PlannerError
 from automation.simple_intent_router import SimpleIntentRouter
+from automation.self_engineering import (
+    collect_diagnostics,
+    EngineeringDirector,
+    EngineeringPolicy,
+    EngineeringTaskStatus,
+    GitManager,
+    SandboxHandle,
+    SandboxManager,
+)
 from cloud import uploads as upload_store
 from cloud.activity_log import activity
 from cloud.auth import require_admin, require_agent, validate_login_token
 from cloud.device_manager import device_manager
+from cloud.engineering import EngineeringTaskStore, redact
 from cloud.settings import settings
 from cloud.telemetry import health as telemetry_health, telemetry
 from cloud.voice import BrowserVoiceSession, voice_tickets
@@ -86,6 +96,10 @@ ACTION_DIR = BASE_DIR / "actions"
 CONFIG_FILE = BASE_DIR / "config" / "api_keys.json"  # local-development legacy path
 TASK_FILE = settings.task_file
 migrate_legacy_file(TASK_FILE, BASE_DIR / "cloud" / "tasks.json")
+ENGINEERING_TASK_FILE = runtime_path(
+    "engineering_tasks.json",
+    BASE_DIR / "cloud" / "engineering_tasks.json",
+)
 HUD_DIR = BASE_DIR / "dashboard" / "static" / "hud"
 
 # Command center assets are plain ES modules — no build step is required.
@@ -219,6 +233,98 @@ def task_counts() -> Dict[str, int]:
         status = task.get("status", "unknown")
         summary[status] = summary.get(status, 0) + 1
     return summary
+
+
+ENGINEERING_EVENT_NAMES = {
+    "repository_inspected": "engineering.repository.inspected",
+    "capability_analyzed": "engineering.capability.analyzed",
+    "plan_created": "engineering.plan.created",
+    "inspecting": "engineering.repository.inspected",
+    "planning": "engineering.plan.created",
+    "approval_required": "engineering.approval.required",
+    "sandbox_created": "engineering.sandbox.created",
+    "change_started": "engineering.change.started",
+    "change_completed": "engineering.change.completed",
+    "tests_started": "engineering.tests.started",
+    "repair_started": "engineering.repair.started",
+    "repair_completed": "engineering.repair.completed",
+    "git_checkpoint_created": "engineering.git.checkpoint.created",
+    "verification_completed": "engineering.verification.completed",
+    "task_failed": "engineering.task.failed",
+}
+
+
+def publish_engineering_event(
+    task_id: str,
+    event_name: str,
+    message: str,
+    *,
+    level: str = "info",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Use the existing activity bus with a namespaced engineering event."""
+    activity.publish(
+        "PLAN" if "plan" in event_name or "approval" in event_name else "EXEC",
+        message,
+        {
+            "event": event_name,
+            "task_id": task_id,
+            **(redact(metadata or {})),
+        },
+        level=level,
+    )
+
+
+def persist_engineering_result(task_id: str, result: Dict[str, Any]) -> None:
+    current = engineering_store.get(task_id)
+    if current and current.get("status") == EngineeringTaskStatus.CANCELLED.value:
+        return
+    engineering_store.put(result)
+    for event in result.get("events", []):
+        stage = str(event.get("stage", "")).lower()
+        event_name = ENGINEERING_EVENT_NAMES.get(stage)
+        if event_name:
+            publish_engineering_event(
+                task_id,
+                event_name,
+                str(event.get("message", event_name)),
+                metadata=event.get("metadata") if isinstance(event.get("metadata"), dict) else {},
+            )
+
+
+async def run_engineering_task(task_id: str, *, approved: bool = False) -> None:
+    task = engineering_store.get(task_id)
+    if not task or task.get("status") == EngineeringTaskStatus.CANCELLED.value:
+        return
+    engineering_workers.add(task_id)
+    try:
+        result = await asyncio.to_thread(
+            engine.submit_engineering_goal,
+            task["goal"],
+            candidate_plan=task.get("candidate_plan"),
+            task_id=task_id,
+            approved=approved,
+            preserve_successful_sandbox=True,
+        )
+        persist_engineering_result(task_id, result.to_dict())
+    except Exception as exc:
+        current = engineering_store.get(task_id) or task
+        current.update({
+            "status": EngineeringTaskStatus.BLOCKED.value,
+            "current_phase": EngineeringTaskStatus.BLOCKED.value,
+            "error": f"{type(exc).__name__}: {exc}",
+            "production_impact": "unchanged",
+        })
+        engineering_store.put(current)
+        publish_engineering_event(
+            task_id,
+            "engineering.task.failed",
+            "Engineering task was blocked before execution.",
+            level="error",
+            metadata={"error": current["error"]},
+        )
+    finally:
+        engineering_workers.discard(task_id)
 
 
 def plan_is_safe_to_retry(plan: Any) -> bool:
@@ -781,6 +887,11 @@ engine = AutonomousEngine(
     ),
 )
 
+engineering_director = EngineeringDirector(BASE_DIR)
+engine.attach_engineering_director(engineering_director)
+engineering_store = EngineeringTaskStore(ENGINEERING_TASK_FILE)
+engineering_workers: set[str] = set()
+
 
 planner = AutonomousPlanner(
     action_registry=action_registry,
@@ -850,6 +961,15 @@ class TaskResultRequest(BaseModel):
 class PermissionApprovalRequest(BaseModel):
     action: str = Field(..., min_length=1, max_length=100)
     parameters: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EngineeringTaskRequest(BaseModel):
+    goal: str = Field(..., min_length=1, max_length=5000)
+    candidate_plan: Optional[Dict[str, Any]] = None
+
+
+class EngineeringApprovalRequest(BaseModel):
+    approved: bool = True
 
 
 class LoginRequest(BaseModel):
@@ -1083,6 +1203,174 @@ async def task_summary():
 
 
 # ============================================================
+# CONTROLLED SELF-ENGINEERING
+# ============================================================
+
+@app.get("/engineering/tasks", dependencies=[Depends(require_admin)])
+async def list_engineering_tasks():
+    return engineering_store.values()
+
+
+@app.get("/engineering/diagnostics", dependencies=[Depends(require_admin)])
+async def engineering_diagnostics():
+    latest = sorted(
+        engineering_store.values(),
+        key=lambda item: str(item.get("created_at", "")),
+        reverse=True,
+    )
+    test_status = {"status": "not_run"}
+    if latest and latest[0].get("test_results"):
+        results = latest[0]["test_results"]
+        test_status = {
+            "status": "passed" if all(item.get("success") for item in results) else "failed",
+            "checks": len(results),
+        }
+    return collect_diagnostics(
+        BASE_DIR,
+        action_count=len(action_registry.names()),
+        test_status=test_status,
+    ).to_dict()
+
+
+@app.post("/engineering/tasks", dependencies=[Depends(require_admin)])
+async def create_engineering_task(request: EngineeringTaskRequest):
+    task_id = f"engineering-{uuid.uuid4().hex[:12]}"
+    task = {
+        "task_id": task_id,
+        "goal": request.goal.strip(),
+        "status": EngineeringTaskStatus.CREATED.value,
+        "current_phase": EngineeringTaskStatus.CREATED.value,
+        "created_at": current_time(),
+        "candidate_plan": redact(request.candidate_plan) if request.candidate_plan else None,
+        "required_approval": False,
+        "production_impact": "unchanged",
+        "events": [{
+            "stage": "created",
+            "message": "Engineering goal accepted by the authenticated Cloud API.",
+            "timestamp": current_time(),
+            "metadata": {"event": "engineering.task.created"},
+        }],
+    }
+    engineering_store.put(task)
+    publish_engineering_event(
+        task_id,
+        "engineering.task.created",
+        "Engineering task created.",
+        metadata={"goal": task["goal"][:160]},
+    )
+    if not engineering_director.enabled:
+        task.update({
+            "status": EngineeringTaskStatus.BLOCKED.value,
+            "current_phase": EngineeringTaskStatus.BLOCKED.value,
+            "error": "Self-engineering is disabled; enable it explicitly for an authenticated engineering run.",
+        })
+        engineering_store.put(task)
+        publish_engineering_event(
+            task_id,
+            "engineering.task.failed",
+            "Self-engineering is disabled by policy.",
+            level="warn",
+        )
+        return task
+    asyncio.create_task(run_engineering_task(task_id), name=f"engineering-{task_id}")
+    return task
+
+
+@app.get("/engineering/tasks/{task_id}", dependencies=[Depends(require_admin)])
+async def get_engineering_task(task_id: str):
+    task = engineering_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Engineering task not found")
+    return task
+
+
+@app.get("/engineering/tasks/{task_id}/events", dependencies=[Depends(require_admin)])
+async def get_engineering_task_events(task_id: str):
+    task = engineering_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Engineering task not found")
+    return {"task_id": task_id, "events": task.get("events", [])}
+
+
+@app.post("/engineering/tasks/{task_id}/approve", dependencies=[Depends(require_admin)])
+async def approve_engineering_task(
+    task_id: str,
+    request: EngineeringApprovalRequest = EngineeringApprovalRequest(),
+):
+    task = engineering_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Engineering task not found")
+    if not request.approved:
+        raise HTTPException(status_code=400, detail="Approval request was not granted")
+    if task.get("status") not in {
+        EngineeringTaskStatus.AWAITING_APPROVAL.value,
+        EngineeringTaskStatus.BLOCKED.value,
+        EngineeringTaskStatus.CREATED.value,
+    }:
+        raise HTTPException(status_code=409, detail="Engineering task is not awaiting approval")
+    task["approval_granted_at"] = current_time()
+    task["required_approval"] = False
+    engineering_store.put(task)
+    publish_engineering_event(task_id, "engineering.approval.granted", "Engineering sandbox approval granted.")
+    if task_id not in engineering_workers:
+        asyncio.create_task(run_engineering_task(task_id, approved=True), name=f"engineering-approve-{task_id}")
+    return engineering_store.get(task_id)
+
+
+@app.post("/engineering/tasks/{task_id}/cancel", dependencies=[Depends(require_admin)])
+async def cancel_engineering_task(task_id: str):
+    task = engineering_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Engineering task not found")
+    if task.get("status") in {
+        EngineeringTaskStatus.COMPLETED.value,
+        EngineeringTaskStatus.ROLLED_BACK.value,
+    }:
+        raise HTTPException(status_code=409, detail="Completed engineering tasks cannot be cancelled")
+    task.update({
+        "status": EngineeringTaskStatus.CANCELLED.value,
+        "current_phase": EngineeringTaskStatus.CANCELLED.value,
+        "completed_at": current_time(),
+        "error": "Cancelled by an authenticated administrator.",
+        "production_impact": "unchanged",
+    })
+    engineering_store.put(task)
+    publish_engineering_event(task_id, "engineering.task.cancelled", "Engineering task cancelled.", level="warn")
+    return task
+
+
+@app.post("/engineering/tasks/{task_id}/rollback", dependencies=[Depends(require_admin)])
+async def rollback_engineering_task(task_id: str):
+    task = engineering_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Engineering task not found")
+    checkpoint = task.get("git_checkpoint") or {}
+    sandbox_path = task.get("sandbox_path")
+    commit = checkpoint.get("commit") if isinstance(checkpoint, dict) else None
+    if not commit or not sandbox_path:
+        raise HTTPException(status_code=409, detail="No preserved sandbox checkpoint is available")
+    sandbox = Path(str(sandbox_path)).resolve()
+    try:
+        sandbox.relative_to(BASE_DIR)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Sandbox path is outside the repository boundary") from exc
+    if not sandbox.is_dir():
+        raise HTTPException(status_code=409, detail="Sandbox is no longer available")
+    policy = EngineeringPolicy(sandbox)
+    reverted = GitManager(sandbox, policy).rollback(str(commit), approved=True)
+    task.update({
+        "status": EngineeringTaskStatus.ROLLED_BACK.value,
+        "current_phase": EngineeringTaskStatus.ROLLED_BACK.value,
+        "rollback_commit": reverted,
+        "production_impact": "unchanged",
+        "completed_at": current_time(),
+    })
+    engineering_store.put(task)
+    publish_engineering_event(task_id, "engineering.task.rolled_back", "Sandbox checkpoint rolled back; production unchanged.", level="warn")
+    return task
+
+
+# ============================================================
 # LIST TASKS
 # ============================================================
 
@@ -1102,6 +1390,13 @@ async def list_tasks():
 async def create_task(
     request: TaskRequest,
 ):
+
+    # Engineering goals use the controlled Director/worktree lifecycle and
+    # never enter the Mac action queue as ordinary planner work.
+    if engine.is_engineering_goal(request.goal):
+        return await create_engineering_task(
+            EngineeringTaskRequest(goal=request.goal)
+        )
 
     task_id = str(
         uuid.uuid4()

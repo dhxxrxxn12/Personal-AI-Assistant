@@ -61,6 +61,30 @@ def test_admin_and_agent_routes_are_separated():
         auth.settings = original
 
 
+def test_engineering_routes_use_admin_auth_and_report_action_count():
+    original = auth.settings
+    auth.settings = replace(
+        original,
+        environment="production",
+        gemini_api_key="configured",
+        admin_token="admin-test-token",
+        agent_token="agent-test-token",
+    )
+    try:
+        with TestClient(server.app) as client:
+            assert client.get("/engineering/tasks").status_code == 401
+            diagnostics = client.get(
+                "/engineering/diagnostics",
+                headers={"Authorization": "Bearer admin-test-token"},
+            )
+            assert diagnostics.status_code == 200
+            payload = diagnostics.json()
+            assert payload["active_action_count"] == 18
+            assert payload["version"]
+    finally:
+        auth.settings = original
+
+
 def test_activity_log_survives_restart(tmp_path):
     path = tmp_path / "activity.json"
     first = ActivityLog(path=path)

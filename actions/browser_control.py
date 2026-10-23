@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import platform
 import shutil
@@ -720,6 +721,26 @@ class _BrowserSession:
         except Exception as e:
             return f"Could not get page text: {e}"
 
+    async def get_visible_elements(self, selector: str, limit: int = 100) -> str:
+        """Read text and a small allowlist of attributes from visible DOM nodes."""
+        if not selector or len(selector) > 300:
+            raise ValueError("A CSS selector of at most 300 characters is required.")
+        page = await self._get_page()
+        locator = page.locator(selector)
+        count = min(max(0, int(limit)), 100)
+        elements = []
+        for index in range(min(await locator.count(), count)):
+            node = locator.nth(index)
+            if not await node.is_visible():
+                continue
+            item = {"text": (await node.inner_text()).strip()}
+            for name in ("href", "aria-label", "data-testid", "title", "datetime"):
+                value = await node.get_attribute(name)
+                if value:
+                    item[name.replace("-", "_")] = value
+            elements.append(item)
+        return json.dumps(elements, ensure_ascii=False)
+
     async def get_url(self) -> str:
         page = await self._get_page()
         return page.url
@@ -1027,6 +1048,13 @@ def browser_control(
             result = sess.run(sess.smart_type(params.get("description", ""), params.get("text", "")))
         elif action == "get_text":
             result = sess.run(sess.get_text())
+        elif action == "get_elements":
+            result = sess.run(
+                sess.get_visible_elements(
+                    params.get("selector", ""),
+                    params.get("limit", 100),
+                )
+            )
         elif action == "get_url":
             result = sess.run(sess.get_url())
         elif action == "press":
@@ -1069,7 +1097,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_elements | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",
@@ -1089,7 +1117,7 @@ TOOL = {
             },
             "selector": {
                 "type": "STRING",
-                "description": "CSS selector for click/type"
+                "description": "CSS selector for click/type/get_elements"
             },
             "text": {
                 "type": "STRING",
@@ -1106,6 +1134,10 @@ TOOL = {
             "amount": {
                 "type": "INTEGER",
                 "description": "Scroll amount in pixels (default: 500)"
+            },
+            "limit": {
+                "type": "INTEGER",
+                "description": "Maximum visible elements returned by get_elements (capped at 100)"
             },
             "key": {
                 "type": "STRING",

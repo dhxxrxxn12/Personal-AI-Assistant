@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import subprocess
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .models import FileInfo, PythonModuleInfo, RepositorySnapshot, utc_now
 
@@ -51,6 +51,7 @@ class RepositoryInspector:
         max_entries: int = 600,
         max_python_modules: int = 180,
         max_source_bytes: int = 512_000,
+        max_tracked_files: int = 2_000,
         git_timeout: float = 5.0,
     ) -> None:
         self.root = Path(root).resolve()
@@ -59,6 +60,7 @@ class RepositoryInspector:
         self.max_entries = max_entries
         self.max_python_modules = max_python_modules
         self.max_source_bytes = max_source_bytes
+        self.MAX_TRACKED_FILES = max(1, int(max_tracked_files))
         self.git_timeout = git_timeout
 
     def _relative(self, path: Path) -> str:
@@ -106,6 +108,40 @@ class RepositoryInspector:
             return []
         return [line for line in completed.stdout.splitlines() if line.strip()]
 
+    @staticmethod
+    def _tool_metadata(tree: ast.Module) -> Tuple[Optional[str], str]:
+        """Read a module-level ``TOOL`` declaration without importing the module.
+
+        Action modules advertise themselves through a module-level ``TOOL``
+        dictionary.  Reading the literal name and description through the AST
+        keeps the capability inventory evidence-backed while preserving the
+        guarantee that inspection never executes repository code.
+        """
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "TOOL" for target in node.targets):
+                continue
+            value = node.value
+            if not isinstance(value, ast.Dict):
+                continue
+            name: Optional[str] = None
+            description = ""
+            for key, item in zip(value.keys, value.values):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    continue
+                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                    continue
+                if key.value == "name":
+                    candidate = item.value.strip()
+                    if candidate:
+                        name = candidate[:64]
+                elif key.value == "description":
+                    description = " ".join(item.value.split())[:200]
+            if name:
+                return name, description
+        return None, ""
+
     def _inspect_python(self, path: Path) -> PythonModuleInfo:
         relative = self._relative(path)
         try:
@@ -140,6 +176,7 @@ class RepositoryInspector:
                     if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                         actions.add(node.args[0].value)
 
+        tool_name, tool_description = self._tool_metadata(tree)
         return PythonModuleInfo(
             path=relative,
             imports=sorted(item for item in imports if item),
@@ -147,6 +184,8 @@ class RepositoryInspector:
             functions=sorted(functions),
             routes=sorted(routes),
             actions=sorted(actions),
+            tool_name=tool_name,
+            tool_description=tool_description,
         )
 
     def inspect(self) -> RepositorySnapshot:
@@ -189,6 +228,7 @@ class RepositoryInspector:
             tests=sorted(tests),
             configs=sorted(configs),
             deployment_files=sorted(deployment_files),
+            tracked_files=sorted(self._git("ls-files"))[: self.MAX_TRACKED_FILES],
             git_status=self._git("status", "--short"),
             git_diff_summary="\n".join(self._git("diff", "--stat")),
             recent_commits=self._git("log", "-5", "--oneline"),

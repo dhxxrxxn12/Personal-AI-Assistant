@@ -43,8 +43,6 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from automation.autonomous_engine import AutonomousEngine
-from automation.autonomous_planner import AutonomousPlanner
 
 import sounddevice as sd
 import numpy as np
@@ -81,6 +79,19 @@ from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
+from core.privacy              import (
+    contains_sensitive_text,
+    is_sensitive_field,
+    redact_sensitive_text,
+    redact_sensitive_value,
+)
+from dashboard.voice_client   import VoiceCommandCenterClient, voice_result_text
+from automation.reminders      import ReminderService
+from automation.proactive_notifications import ProactiveNotificationCoordinator
+from automation.permission_manager import PermissionManager
+from automation.audio_ownership import AudioOwnershipManager, audio_gate_enabled
+from automation.call_coordinator import get_default_call_coordinator
+from automation.call_audio_integration import CallAudioBridge
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
@@ -96,7 +107,7 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000 
+SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
@@ -139,7 +150,7 @@ def _load_system_prompt() -> str:
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
+def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
@@ -314,10 +325,11 @@ TOOL_DECLARATIONS = [
         {
         "name": "autonomous_task",
         "description": (
-            "Give JARVIS a complex multi-step goal that requires planning "
-            "and execution across available actions. Use this when the user's "
-            "request involves multiple steps or when the correct sequence "
-            "of actions is not obvious."
+            "Submit a complex or multi-step user goal to JARVIS's existing "
+            "local AutonomousRuntime through the Local Command Center. Use "
+            "this for planning and execution across available actions. Never "
+            "claim an action is approved; pending permission must be approved "
+            "in the Command Center."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -381,6 +393,10 @@ class JarvisLive:
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._audio_gate_enabled  = audio_gate_enabled()
+        self._audio_gate_session  = None
+        self._audio_gate_generation = 0
+        self._gemini_audio_suspended = False
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -412,13 +428,133 @@ class JarvisLive:
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
+        self._voice_goal_monitors = {}
         self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._reminder_service = ReminderService(
+            deliver=self._deliver_reminder,
+        )
+        self._proactive_coordinator = ProactiveNotificationCoordinator(
+            voice_send=self._send_proactive_voice,
+            available=self._proactive_voice_available,
+        )
+        self._proactive_event_id = None
+        self._proactive_audio_seen = False
+        self._permission_manager = PermissionManager()
+        self._audio_ownership = AudioOwnershipManager(gemini=self) if self._audio_gate_enabled else None
+        self._call_coordinator = get_default_call_coordinator() if self._audio_gate_enabled else None
+        self._call_audio_bridge = (
+            CallAudioBridge(self._call_coordinator, self._audio_ownership)
+            if self._audio_ownership is not None and self._call_coordinator is not None else None
+        )
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
+
+    def suspend_for_call(self) -> bool:
+        """Suspend only the current Gemini audio path for an owned fake call."""
+        if not self._audio_gate_enabled or self.session is None:
+            return False
+        with self._speaking_lock:
+            if self._gemini_audio_suspended:
+                return True
+            self._gemini_audio_suspended = True
+            self._audio_gate_session = self.session
+            self._audio_gate_generation += 1
+        self.set_speaking(False)
+        if self.audio_in_queue is not None:
+            while True:
+                try:
+                    self.audio_in_queue.get_nowait()
+                except Exception:
+                    break
+        self._proactive_coordinator.defer_active("Call audio owns the audio path.")
+        return True
+
+    def can_restore_after_call(self) -> bool:
+        if not self._audio_gate_enabled:
+            return False
+        with self._speaking_lock:
+            return bool(
+                self._gemini_audio_suspended
+                and self.session is self._audio_gate_session
+                and self.session is not None
+                and self._reconnect_event is not None
+                and not self._reconnect_event.is_set()
+            )
+
+    def restore_after_call(self) -> bool:
+        if not self.can_restore_after_call():
+            return False
+        with self._speaking_lock:
+            self._gemini_audio_suspended = False
+            self._audio_gate_session = None
+        return True
+
+    def call_audio_status(self) -> dict:
+        if self._call_audio_bridge is None:
+            return {"enabled": False, "state": "DISABLED", "healthy": True, "owner": None}
+        status = self._call_audio_bridge.status()
+        status["enabled"] = True
+        return status
+
+    def shutdown_call_audio(self) -> None:
+        if self._call_audio_bridge is not None:
+            self._call_audio_bridge.shutdown()
+
+    def _deliver_reminder(self, record: dict) -> None:
+        event = self._proactive_coordinator.enqueue_reminder(record)
+        self.ui.write_log(
+            f"[Reminder] Queued notification — {record.get('message', '')[:80]} "
+            f"({event.get('status', 'queued')})"
+        )
+
+    def _proactive_voice_available(self) -> bool:
+        if not self.session or not self._awake or self.ui.muted or self._interrupted or self._gemini_audio_suspended:
+            return False
+        with self._speaking_lock:
+            if self._is_speaking:
+                return False
+        return (time.monotonic() - self._last_user_speech) >= 5.0
+
+    def _send_proactive_voice(self, event_id: str, text: str) -> bool:
+        if not self._proactive_voice_available():
+            return False
+        self._proactive_event_id = event_id
+        self._proactive_audio_seen = False
+
+        async def _send() -> None:
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": (
+                        "Deliver this concise proactive notification naturally in the user's "
+                        "current language. Do not call tools or perform the described action. "
+                        f"Notification: {text}"
+                    )}]},
+                    turn_complete=True,
+                )
+            except Exception as exc:
+                if self._proactive_event_id == event_id:
+                    self._proactive_event_id = None
+                    self._proactive_coordinator.defer_active(
+                        f"Voice submission failed: {type(exc).__name__}"
+                    )
+
+        asyncio.create_task(_send())
+        self.ui.write_log(f"SYS: Proactive notification attempting ({event_id[:32]}).")
+        return True
+
+    async def _run_reminder_scheduler(self) -> None:
+        """Poll the durable reminder ledger; delivery is notification-only."""
+        while True:
+            try:
+                self._reminder_service.tick()
+                self._proactive_coordinator.tick()
+            except Exception as exc:
+                self.ui.write_log(f"ERR: Reminder scheduler unavailable — {redact_sensitive_text(exc)[:160]}")
+            await asyncio.sleep(1.0)
 
         _base_dir = Path(__file__).resolve().parent
         _inline_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -431,25 +567,7 @@ class JarvisLive:
             reserved_names=_inline_names,
             logger=lambda msg: print(f"[Actions] {msg}"),
         )
-                # Autonomous JARVIS: connect the planner and learning engine
-        # to the existing action registry.
-        self._autonomous_engine = AutonomousEngine(
-            action_registry=self._action_registry,
-            context={
-                "player": self.ui,
-                "speak": self.speak,
-                "response": None,
-                "session_memory": None,
-            },
-            logger=lambda msg: print(f"[Autonomous] {msg}"),
-        )
-
-        self._autonomous_planner = AutonomousPlanner(
-        action_registry=self._action_registry,
-        learning_memory=self._autonomous_engine.learning,
-        logger=lambda msg: print(f"[Planner] {msg}"),
-        api_key=_get_api_key(),
-      )
+        self._voice_goal_client = VoiceCommandCenterClient()
 
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
@@ -688,6 +806,9 @@ class JarvisLive:
             if drained:
                 print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
+        if self._proactive_event_id:
+            self._proactive_event_id = None
+            self._proactive_coordinator.defer_active("User interrupted the announcement.")
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
@@ -703,8 +824,49 @@ class JarvisLive:
             self._loop
         )
 
+    def _start_voice_goal_monitor(self, task_id: str) -> None:
+        if task_id in self._voice_goal_monitors:
+            return
+        task = asyncio.create_task(self._report_voice_goal(task_id))
+        self._voice_goal_monitors[task_id] = task
+        task.add_done_callback(
+            lambda completed, key=task_id: self._finish_voice_goal_monitor(key, completed)
+        )
+
+    def _finish_voice_goal_monitor(self, task_id: str, task: asyncio.Task) -> None:
+        self._voice_goal_monitors.pop(task_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            safe_error = redact_sensitive_text(error)
+            self.ui.write_log(f"ERR: Autonomous task status unavailable — {safe_error[:160]}")
+
+    async def _report_voice_goal(self, task_id: str) -> None:
+        while True:
+            task = await self._voice_goal_client.wait_for_task(task_id)
+            state = str(task.get("status") or "UNKNOWN").upper()
+            if state not in {"QUEUED", "RUNNING", "APPROVAL_PROCESSING", "RECOVERING"}:
+                break
+            await asyncio.sleep(0.25)
+
+        message = (
+            "The autonomous task status is ready. Report this result to the user "
+            "in their current conversation language. Do not call any tools or "
+            "approve any actions. Result: "
+            + redact_sensitive_text(voice_result_text(task))[:1600]
+        )
+        event = self._proactive_coordinator.enqueue_event(
+            f"autonomous-task:{task_id}",
+            "autonomous_task",
+            message,
+            priority="urgent" if state == "AWAITING_PERMISSION" else "ordinary",
+            metadata={"task_id": task_id, "status": state},
+        )
+        self.ui.write_log(f"SYS: Autonomous task notification queued ({event['status']}).")
+
     def speak_error(self, tool_name: str, error: str):
-        short = str(error)[:120]
+        short = redact_sensitive_text(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
@@ -796,21 +958,35 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        safe_args = redact_sensitive_value(args)
+        if name == "autonomous_task":
+            print(f"[JARVIS] 🔧 {name}")
+        else:
+            print(f"[JARVIS] 🔧 {name}  {safe_args}")
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
             value    = args.get("value", "")
-            if key and value:
+            memory_result = "ok"
+            if (
+                is_sensitive_field(category)
+                or is_sensitive_field(key)
+                or any(contains_sensitive_text(item) for item in (category, key, value))
+            ):
+                memory_result = "Sensitive credential or authentication data was not saved."
+            elif key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                print(f"[Memory] 💾 save_memory: {category}/{redact_sensitive_text(key)}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
                 id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
+                response={
+                    "result": memory_result,
+                    "silent": memory_result == "ok",
+                }
             )
 
         loop   = asyncio.get_event_loop()
@@ -901,234 +1077,53 @@ class JarvisLive:
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
-                  
+
             elif name == "autonomous_task":
                 goal = str(args.get("goal", "")).strip()
-
-                if not goal:
-                    result = "I need a goal to execute autonomously."
-                else:
-                    print(f"[Autonomous] 🧠 Goal: {goal}")
-
-                    try:
-                        history = []
-                        executed_tasks = []
-
-                        max_steps = self._autonomous_planner.max_steps
-
-                        for step_number in range(1, max_steps + 1):
-                            print(
-                                f"[Autonomous] 🔄 Reasoning step "
-                                f"{step_number}/{max_steps}"
-                            )
-
-                            decision = await loop.run_in_executor(
-                                None,
-                                lambda: self._autonomous_planner.next_task(
-                                    goal,
-                                    history,
-                                )
-                            )
-
-                            if decision.get("done"):
-                                reason = decision.get(
-                                    "reason",
-                                    "Goal completed.",
-                                )
-
-                                print(
-                                    f"[Autonomous] 🎯 Goal complete: "
-                                    f"{reason}"
-                                )
-                                 
-                                if executed_tasks:
-                                    learned = (
-                                    self._autonomous_engine.learn_workflow(
-                                        name=f"Autonomous: {goal[:60]}",
-                                        goal=goal,
-                                        tasks=executed_tasks,
-                                    )
-                                )
-
-                                if learned:
-                                    print(
-                                        "[Autonomous] 🧠 "
-                                        "Workflow learned successfully."
-                                    )
-                                result = (
-                                    f"Autonomous task completed in "
-                                    f"{len(executed_tasks)} step(s). "
-                                    f"{reason}"
-                                )
-                                break
-
-                            task = decision.get("task")
-
-                            if task is None:
-                                raise RuntimeError(
-                                    "Planner returned no task."
-                                )
-
-                            print(
-                                f"[Autonomous] ▶️ Executing: "
-                                f"{task.action}"
-                            )
-
-                                                        # --------------------------------------------------
-                            # EXECUTE CURRENT TASK
-                            # --------------------------------------------------
-
-                            print(
-                                f"[Autonomous] ▶️ Executing: "
-                                f"{task.action}"
-                            )
-
-                            task_result = await loop.run_in_executor(
-                                None,
-                                lambda: self._autonomous_engine.execute_task(
-                                    task
-                                )
-                            )
-
-                            success = getattr(
-                                task_result,
-                                "success",
-                                False,
-                            )
-
-                            permission_required = getattr(
-                                task_result,
-                                "permission_required",
-                                False,
-                            )
-
-                            task_output = getattr(
-                                task_result,
-                                "result",
-                                None,
-                            )
-
-                            task_error = getattr(
-                                task_result,
-                                "error",
-                                None,
-                            )
-
-                            print(
-                                f"[Autonomous] "
-                                f"{'✅' if success else '❌'} "
-                                f"{task.action}"
-                            )
-
-                            # --------------------------------------------------
-                            # RECORD EXECUTION HISTORY
-                            # --------------------------------------------------
-
-                            history.append(
-                                {
-                                    "step": step_number,
-                                    "action": task.action,
-                                    "parameters": task.parameters,
-                                    "description": task.description,
-                                    "success": success,
-                                    "permission_required": (
-                                        permission_required
-                                    ),
-                                    "result": str(
-                                        task_output
-                                    )[:2000],
-                                    "error": (
-                                        str(task_error)[:1000]
-                                        if task_error
-                                        else None
-                                    ),
-                                }
-                            )
-
-                            # --------------------------------------------------
-                            # PERMISSION REQUIRED
-                            # --------------------------------------------------
-
-                            if permission_required:
-                                result = (
-                                    f"Autonomous task paused: "
-                                    f"permission is required for "
-                                    f"'{task.action}'."
-                                )
-
-                                print(
-                                    f"[Autonomous] ⚠️ {result}"
-                                )
-                                break
-
-                            # --------------------------------------------------
-                            # SUCCESS
-                            # --------------------------------------------------
-
-                            if success:
-
-                                executed_tasks.append(task)
-
-                                print(
-                                    f"[Autonomous] ✅ "
-                                    f"Step {step_number} completed."
-                                )
-
-                                continue
-
-                            # --------------------------------------------------
-                            # FAILURE → LET GEMINI RE-PLAN
-                            # --------------------------------------------------
-
-                            print(
-                                f"[Autonomous] ❌ "
-                                f"'{task.action}' failed."
-                            )
-
-                            print(
-                                "[Autonomous] 🧠 "
-                                "Attempting automatic re-planning..."
-                            )
-
-                            # Do NOT add the failed task to the learned
-                            # workflow. The history is enough for Gemini
-                            # to understand what failed.
-
-                            if step_number >= max_steps:
-                                result = (
-                                    f"Autonomous task failed at "
-                                    f"'{task.action}' after reaching "
-                                    f"the maximum step limit."
-                                )
-
-                                print(
-                                    f"[Autonomous] ⚠️ {result}"
-                                )
-                                break
-
-                            print(
-                                "[Autonomous] 🔄 "
-                                "Gemini will choose an alternative "
-                                "next action."
-                            )
-
-                            # Continue the loop.
-                            # next_task() receives the updated history,
-                            # including the failure, and can choose
-                            # another action.
-                            continue
-
-                    except Exception as exc:
-                        result = f"Autonomous task failed: {exc}"
-                        print(f"[Autonomous] ❌ {exc}")
+                task = await self._voice_goal_client.submit_goal(
+                    goal,
+                    str(getattr(fc, "id", "") or ""),
+                )
+                result = voice_result_text(task)
+                task_id = task.get("task_id")
+                state = str(task.get("status") or "").upper()
+                if isinstance(task_id, str) and state in {
+                    "QUEUED", "RUNNING", "APPROVAL_PROCESSING", "RECOVERING"
+                }:
+                    self._start_voice_goal_monitor(task_id)
+                    result = (
+                        "The goal is now running in the shared local Command Center. "
+                        f"I'll report its result when the runtime finishes. Task {task_id}."
+                    )
+                safe_result = redact_sensitive_text(result)
+                self.ui.write_log(f"SYS: {safe_result[:240]}")
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                print(f"[Autonomous] {safe_result[:240]}")
+                return types.FunctionResponse(
+                    id=fc.id,
+                    name=name,
+                    response={"result": safe_result},
+                )
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None, "session_memory": None}
-                r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
-                result = r or "Done."
+                permission = self._permission_manager.check(name, args)
+                if not permission.allowed:
+                    result = f"I can't run {name}: {permission.reason}"
+                elif permission.requires_confirmation:
+                    result = confirm_gate.request(
+                        f"voice-{name}", f"Run {name}", permission.reason,
+                        lambda: self._action_registry.run(name, args, _ctx),
+                    )
+                else:
+                    r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
+                    result = r or "Done."
+                    if name == "reminder" and str(args.get("operation", "")).lower() in {"cancel", "reschedule"}:
+                        self._proactive_coordinator.dismiss_reminder(str(args.get("reminder_id") or ""))
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
                         and not r.startswith("No results")
@@ -1149,14 +1144,14 @@ class JarvisLive:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
-            traceback.print_exc()
-            self.speak_error(name, e)
+            safe_error = redact_sensitive_text(e)
+            result = f"Tool '{name}' failed: {safe_error}"
+            self.speak_error(name, safe_error)
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        print(f"[JARVIS] 📤 {name} → {redact_sensitive_text(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -1165,6 +1160,8 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
+            if self._gemini_audio_suspended:
+                continue
             # Gemini 3.x Live rejects the old realtime_input.media_chunks field
             # (what `media=...` maps to) and closes the socket with a 1007. Send
             # mic / phone PCM through the new `audio` field instead. Queue items
@@ -1196,7 +1193,7 @@ class JarvisLive:
                 return
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+            if not jarvis_speaking and not self.ui.muted and not self._phone_active and not self._gemini_audio_suspended:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
@@ -1273,7 +1270,7 @@ class JarvisLive:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
 
-                    if response.data:
+                    if response.data and not self._gemini_audio_suspended:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -1282,6 +1279,8 @@ class JarvisLive:
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
                             _audio_data = response.data
+                            if self._proactive_event_id:
+                                self._proactive_audio_seen = True
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
                                 self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
@@ -1307,6 +1306,9 @@ class JarvisLive:
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
+                                if self._proactive_event_id:
+                                    self._proactive_event_id = None
+                                    self._proactive_coordinator.defer_active("Announcement interrupted.")
                                 self._interrupted = False
                                 in_buf  = []
                                 out_buf = []
@@ -1314,24 +1316,34 @@ class JarvisLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                                self._session_log.append(f"User: {full_in}")
+                                safe_full_in = redact_sensitive_text(full_in)
+                                self.ui.write_log(f"You: {safe_full_in}")
+                                self._session_log.append(f"User: {safe_full_in}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
-                                        "text": full_in,
+                                        "text": safe_full_in,
                                         "ts": datetime.now().isoformat(),
                                     }))
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
+                            if self._proactive_event_id:
+                                event_id = self._proactive_event_id
+                                self._proactive_event_id = None
+                                self._proactive_coordinator.mark_output_complete(
+                                    event_id=event_id,
+                                    produced_audio=self._proactive_audio_seen or bool(full_out),
+                                )
+                                self._proactive_audio_seen = False
                             if full_out:
-                                self.ui.write_log(f"{self._asst_name}: {full_out}")
-                                self._session_log.append(f"{self._asst_name}: {full_out}")
+                                safe_full_out = redact_sensitive_text(full_out)
+                                self.ui.write_log(f"{self._asst_name}: {safe_full_out}")
+                                self._session_log.append(f"{self._asst_name}: {safe_full_out}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
-                                        "text": full_out,
+                                        "text": safe_full_out,
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
@@ -1427,6 +1439,10 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    continue
+
+                if self._gemini_audio_suspended:
+                    self.set_speaking(False)
                     continue
 
                 self.set_speaking(True)
@@ -1733,7 +1749,7 @@ class JarvisLive:
             self._phone_active = True   # phone is streaming — silence PC mic
             with self._speaking_lock:
                 speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
+            if not speaking and not self.ui.muted and not self._gemini_audio_suspended:
                 try:
                     self.out_queue.put_nowait(chunk)
                 except asyncio.QueueFull:
@@ -1767,9 +1783,9 @@ class JarvisLive:
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
                     )
-                    self.ui.write_log(f"[Web]: {text}")
+                    self.ui.write_log(f"[Web]: {redact_sensitive_text(text)}")
                 else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                    print(f"[Dashboard] Dropped command (no session): {redact_sensitive_text(text)}")
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
@@ -1834,6 +1850,15 @@ class JarvisLive:
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
+                    self._audio_gate_generation += 1
+                    self._audio_gate_session = session
+                    # A reconnect must not reactivate Gemini over an active
+                    # simulated-call lease.  The new session can be restored
+                    # only after the lease is released.
+                    self._gemini_audio_suspended = bool(
+                        self._call_audio_bridge is not None
+                        and self._call_audio_bridge.active_call_id is not None
+                    )
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
@@ -1845,6 +1870,9 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._proactive_event_id  = None
+                    self._proactive_audio_seen = False
+                    self._proactive_coordinator.defer_active("Live session reconnected.")
 
                     print("[JARVIS] Connected.")
                     if _resumed_with:
@@ -1876,6 +1904,7 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
+                    tg.create_task(self._run_reminder_scheduler())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
                     if self._dashboard:
@@ -1996,6 +2025,8 @@ def main():
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
+        finally:
+            jarvis.shutdown_call_audio()
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()

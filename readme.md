@@ -212,6 +212,69 @@ python main.py
 
 > ⚠️ **Installation Note:** If you hit a `ModuleNotFoundError` for an OS-specific package, install it with `pip install <module_name>`. The optional **wake word** engine is *not* installed here — grab it in one click from **⚙ → WAKE WORD** inside the app.
 
+### Local Command Center and Unified Voice (Phases 1–2)
+
+The local web command center uses the existing `AutonomousRuntime`, action
+registry, workflow engine, and permission manager. It is a separate local
+interface; the desktop voice entry point, Mac Agent, and phone dashboard are
+not replaced.
+
+From the repository root, using the project's Python 3.11 environment, start
+it with:
+
+```bash
+source .venv/bin/activate
+python -m dashboard.local_command_center
+```
+
+If setting up a fresh checkout, create the environment and install the existing
+requirements first:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Then open <http://127.0.0.1:8765>. The server binds to IPv4 loopback only and
+rejects requests from non-loopback peers. It does not use the Cloud server,
+remote persistence, a CDN, or browser storage. Runtime workflow state continues
+to use the existing local persistence path under `~/.jarvis/`; the task and
+activity panels reflect the current command-center process and restored latest
+runtime workflow.
+
+Goals run through the runtime planner and workflow engine. Actions that the
+existing permission manager marks for confirmation pause until they are
+approved or denied in the permission queue. A denied action is not executed.
+Briefing history and a social summary appear only when local runtime records
+are available; loading the social panel does not open a browser or access an
+account.
+
+For unified voice commands, leave the command center running and start the
+existing desktop voice interface in another terminal:
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+The voice `autonomous_task` intent submits through the command center's
+loopback API, so voice and the browser show the same task state and use the
+same `AutonomousRuntime`, action registry, and permission decisions. Spoken
+phrases never approve a pending action; review and approve or deny it in the
+Command Center. If the local service is unavailable, voice reports that
+instead of falling back to the retired voice-only planner. Sensitive-looking
+credential or authentication values are rejected at goal submission and
+redacted from conversation logs and session summaries. The existing Gemini
+Live speech/intent provider remains unchanged; this phase adds no cloud service
+or remote persistence.
+
+Press **Ctrl+C** in the command-center terminal to stop its server; shutdown
+waits for an in-flight runtime call to finish rather than killing it mid-action.
+Close the desktop voice interface as usual to stop voice operation. If startup
+reports that `JARVIS_DATA_DIR` is set, unset it before launching so
+command-center state cannot use a configured external data directory.
+
 ---
 
 ## 📋 Requirements

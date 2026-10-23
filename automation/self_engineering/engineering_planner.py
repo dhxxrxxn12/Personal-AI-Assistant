@@ -42,8 +42,11 @@ class EngineeringPlanner:
             raise PlanValidationError(f"{field} targets a protected environment file.")
         if any(part in {".git", ".venv", "__pycache__"} for part in value.split("/")):
             raise PlanValidationError(f"{field} targets a protected directory.")
+        lowered = name.lower()
+        if any(marker in lowered for marker in ("credential", "client_secret", "api_key", "token")):
+            raise PlanValidationError(f"{field} targets a protected secret-like file.")
 
-    def _step(self, raw: Any, index: int) -> EngineeringStep:
+    def _step(self, raw: Any, index: int, snapshot: Optional[RepositorySnapshot] = None) -> EngineeringStep:
         if not isinstance(raw, dict):
             raise PlanValidationError(f"steps[{index}] must be an object.")
         required = ("id", "description", "operation")
@@ -63,6 +66,24 @@ class EngineeringPlanner:
         for field, values in (("files", files), ("tests", tests)):
             for value in values:
                 self._validate_relative_path(value, f"steps[{index}].{field}")
+        if snapshot is not None:
+            known_files = set(snapshot.tree) | set(snapshot.tests) | set(snapshot.configs) | set(snapshot.deployment_files)
+            existing_ops = {
+                EngineeringOperation.READ_SOURCE.value,
+                EngineeringOperation.RENAME_FILE.value,
+                EngineeringOperation.DELETE_FILE.value,
+            }
+            if operation in existing_ops:
+                missing = [value for value in files if value not in known_files]
+                if missing:
+                    raise PlanValidationError(
+                        f"steps[{index}] references files not found by repository inspection: {', '.join(missing)}."
+                    )
+            missing_tests = [value for value in tests if value not in known_files]
+            if missing_tests:
+                raise PlanValidationError(
+                    f"steps[{index}] references tests not found by repository inspection: {', '.join(missing_tests)}."
+                )
         risk = str(raw.get("risk", "low")).lower().strip()
         if risk not in {item.value for item in RiskLevel}:
             raise PlanValidationError(f"steps[{index}].risk is invalid.")
@@ -82,7 +103,13 @@ class EngineeringPlanner:
             requires_approval=requires_approval,
         )
 
-    def validate(self, raw: Dict[str, Any], *, source: str = "generated") -> EngineeringPlan:
+    def validate(
+        self,
+        raw: Dict[str, Any],
+        *,
+        source: str = "generated",
+        snapshot: Optional[RepositorySnapshot] = None,
+    ) -> EngineeringPlan:
         if not isinstance(raw, dict):
             raise PlanValidationError("Plan must be a JSON object.")
         try:
@@ -95,14 +122,14 @@ class EngineeringPlanner:
         analysis = raw.get("analysis", "")
         if not isinstance(goal, str) or not goal.strip():
             raise PlanValidationError("Plan goal is empty.")
-        if not isinstance(analysis, str):
-            raise PlanValidationError("Plan analysis must be a string.")
         steps_raw = raw.get("steps")
         if not isinstance(steps_raw, list) or not steps_raw:
             raise PlanValidationError("Plan contains no tasks.")
+        if not isinstance(analysis, str) or not analysis.strip():
+            raise PlanValidationError("Plan analysis must be a string.")
         if len(steps_raw) > self.max_steps:
             raise PlanValidationError(f"Plan exceeds maximum of {self.max_steps} steps.")
-        steps = [self._step(item, index) for index, item in enumerate(steps_raw)]
+        steps = [self._step(item, index, snapshot) for index, item in enumerate(steps_raw)]
         ids = [step.id for step in steps]
         if len(set(ids)) != len(ids):
             raise PlanValidationError("Plan step IDs must be unique.")
@@ -115,6 +142,48 @@ class EngineeringPlanner:
         verification = self._string_list(raw.get("verification_plan", []), "verification_plan")
         if not verification:
             raise PlanValidationError("verification_plan must contain at least one check.")
+        assumptions = self._string_list(raw.get("assumptions", []), "assumptions")
+        affected_files = self._string_list(raw.get("affected_files", []), "affected_files")
+        proposed_changes = self._string_list(raw.get("proposed_changes", []), "proposed_changes")
+        dependencies = self._string_list(raw.get("dependencies", []), "dependencies")
+        plan_tests = self._string_list(raw.get("tests", []), "tests")
+        known_files = (
+            (set(snapshot.tree) | set(snapshot.tests) | set(snapshot.configs) | set(snapshot.deployment_files))
+            if snapshot is not None else set()
+        )
+        for value in plan_tests:
+            self._validate_relative_path(value, "tests")
+            if snapshot is not None and value not in known_files:
+                raise PlanValidationError(f"tests references a file not found by repository inspection: {value}.")
+        for value in affected_files:
+            self._validate_relative_path(value, "affected_files")
+        if snapshot is not None:
+            new_files = {
+                file_name
+                for step in steps
+                if step.operation == EngineeringOperation.CREATE_FILE.value
+                for file_name in step.files
+            }
+            unknown_affected = [
+                value for value in affected_files
+                if value not in known_files and value not in new_files
+            ]
+            if unknown_affected:
+                raise PlanValidationError(
+                    "affected_files references files not found by repository inspection: "
+                    + ", ".join(unknown_affected)
+                    + "."
+                )
+        risk = str(raw.get("risk", "low")).strip().lower()
+        if risk not in {item.value for item in RiskLevel}:
+            raise PlanValidationError("risk is invalid.")
+        risk_order = {item.value: index for index, item in enumerate(RiskLevel)}
+        highest_step_risk = max((risk_order[step.risk] for step in steps), default=0)
+        if risk_order[risk] < highest_step_risk:
+            raise PlanValidationError("Plan risk must cover the risk of every step.")
+        rollback_strategy = raw.get("rollback_strategy", "Remove the isolated worktree without changing production.")
+        if not isinstance(rollback_strategy, str) or not rollback_strategy.strip():
+            raise PlanValidationError("rollback_strategy must be a non-empty string.")
         approval_steps = {step.id for step in steps if step.requires_approval}
         if approval_steps and not approvals:
             raise PlanValidationError("required_approvals must name the approval boundary for mutating steps.")
@@ -126,14 +195,27 @@ class EngineeringPlanner:
             verification_plan=verification,
             source=source,
             version=version,
+            assumptions=assumptions,
+            affected_files=affected_files,
+            proposed_changes=proposed_changes,
+            dependencies=dependencies,
+            tests=plan_tests,
+            risk=risk,
+            rollback_strategy=rollback_strategy.strip(),
         )
 
-    def parse_json(self, value: str, *, source: str = "generated") -> EngineeringPlan:
+    def parse_json(
+        self,
+        value: str,
+        *,
+        source: str = "generated",
+        snapshot: Optional[RepositorySnapshot] = None,
+    ) -> EngineeringPlan:
         try:
             raw = json.loads(value)
         except (TypeError, json.JSONDecodeError) as exc:
             raise PlanValidationError(f"Plan is not valid JSON: {exc}") from exc
-        return self.validate(raw, source=source)
+        return self.validate(raw, source=source, snapshot=snapshot)
 
     def fallback(self, goal: str, analysis: CapabilityAnalysis, snapshot: RepositorySnapshot) -> EngineeringPlan:
         """Produce a bounded, read/test-only plan when provider output is invalid."""
@@ -171,9 +253,10 @@ class EngineeringPlanner:
             "steps": [step.to_dict() for step in steps],
             "required_approvals": [],
             "verification_plan": ["All existing tests pass", "No protected path is modified"],
+            "tests": snapshot.tests[:20],
             "version": self.PLAN_VERSION,
         }
-        return self.validate(raw, source="deterministic_fallback")
+        return self.validate(raw, source="deterministic_fallback", snapshot=snapshot)
 
     @staticmethod
     def _slug(value: str) -> str:

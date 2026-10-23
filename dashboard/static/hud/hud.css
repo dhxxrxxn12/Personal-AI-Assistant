@@ -304,10 +304,17 @@ body.hud-body {
 
 .hud-bottom {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.05fr) minmax(0, 0.95fr);
+  grid-template-columns: minmax(0, 1.25fr) repeat(3, minmax(0, 1fr));
   gap: var(--gap);
   align-items: start;
 }
+
+.engineering-view { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.engineering-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.engineering-controls { display: inline-flex; gap: 5px; margin-left: auto; }
+.engineering-goal { margin: 0; color: var(--text); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.engineering-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.engineering-grid span { white-space: pre-line; color: var(--muted); font-size: 8px; letter-spacing: 0.12em; line-height: 1.5; }
 
 /* --- HUD panel: 1px cut-corner frame + translucent surface ---------------- */
 .panel-frame {
@@ -421,9 +428,9 @@ body.hud-body {
 .pill--running, .pill--active { color: var(--cyan); }
 .pill--queued, .pill--planned { color: var(--blue); }
 .pill--planning, .pill--recovering { color: var(--cyan-bright); }
-.pill--waiting_permission, .pill--warn { color: var(--amber); }
+.pill--waiting_permission, .pill--awaiting_approval, .pill--awaiting_deploy_approval, .pill--warn { color: var(--amber); }
 .pill--needs_review { color: var(--magenta); }
-.pill--failed, .pill--error, .pill--offline { color: var(--red); }
+.pill--failed, .pill--blocked, .pill--error, .pill--offline { color: var(--red); }
 .pill--cancelled, .pill--unknown, .pill--idle { color: var(--muted-dim); }
 
 .bar {

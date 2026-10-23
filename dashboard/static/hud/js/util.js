@@ -99,7 +99,10 @@ export function statusTone(status) {
     case "completed": return "ok";
     case "running": return "accent";
     case "waiting_permission": return "warn";
+    case "awaiting_approval":
+    case "awaiting_deploy_approval": return "warn";
     case "failed": return "danger";
+    case "blocked": return "danger";
     case "needs_review": return "accent";
     default: return null;
   }

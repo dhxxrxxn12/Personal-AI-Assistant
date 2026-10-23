@@ -1,0 +1,98 @@
+{
+  "title": "JARVIS proactive experience capability map",
+  "version": 1,
+  "generated_by": "controlled self-engineering analysis",
+  "current": [
+    {"capability": "scheduler", "evidence": ["automation/autonomous_engine.py"], "status": "partial"},
+    {"capability": "memory", "evidence": ["automation/learning_memory.py", "memory/memory_manager.py"], "status": "available"},
+    {"capability": "planner", "evidence": ["automation/autonomous_planner.py"], "status": "available"},
+    {"capability": "voice", "evidence": ["cloud/voice.py", "dashboard/static/hud/js/voice.js"], "status": "available"},
+    {"capability": "Mac Agent", "evidence": ["agent/mac_agent.py"], "status": "available"},
+    {"capability": "cloud", "evidence": ["cloud/server.py"], "status": "available"},
+    {"capability": "dashboard", "evidence": ["dashboard/static/jarvis-command-center.html"], "status": "available"},
+    {"capability": "task queue", "evidence": ["cloud/server.py"], "status": "available"}
+  ],
+  "missing": [
+    {
+      "capability": "proactive scheduler",
+      "complexity": "medium",
+      "dependencies": ["durable scheduler", "timezone policy"],
+      "api_requirements": ["schedule CRUD", "trigger events"],
+      "privacy_implications": ["timing and preference data"],
+      "cost": "low to medium",
+      "permissions": ["user approval for recurring notifications"],
+      "testing": ["time zones", "restart recovery", "duplicate trigger prevention"]
+    },
+    {
+      "capability": "context aggregator",
+      "complexity": "high",
+      "dependencies": ["calendar integration", "email integration", "weather"],
+      "api_requirements": ["provider OAuth", "normalized context schema"],
+      "privacy_implications": ["personal data aggregation", "data retention"],
+      "cost": "medium",
+      "permissions": ["per-provider read scopes", "revocation"],
+      "testing": ["redaction", "provider outage", "stale data"]
+    },
+    {
+      "capability": "personalized briefing engine",
+      "complexity": "medium",
+      "dependencies": ["context aggregator", "memory", "notification layer"],
+      "api_requirements": ["briefing generation", "preference settings"],
+      "privacy_implications": ["profile inference", "localization"],
+      "cost": "medium",
+      "permissions": ["briefing schedule approval"],
+      "testing": ["empty context", "timezone boundaries", "prompt safety"]
+    },
+    {
+      "capability": "calendar integration",
+      "complexity": "medium",
+      "dependencies": ["OAuth client", "provider API"],
+      "api_requirements": ["read events", "token revoke"],
+      "privacy_implications": ["event titles and attendees"],
+      "cost": "low",
+      "permissions": ["explicit account consent"],
+      "testing": ["OAuth expiry", "pagination", "provider errors"]
+    },
+    {
+      "capability": "email integration",
+      "complexity": "high",
+      "dependencies": ["OAuth client", "provider API", "redaction policy"],
+      "api_requirements": ["read summaries", "token revoke"],
+      "privacy_implications": ["message metadata and content"],
+      "cost": "medium",
+      "permissions": ["read-only scope", "per-request disclosure"],
+      "testing": ["secret redaction", "large mailbox", "provider outage"]
+    },
+    {
+      "capability": "notification layer",
+      "complexity": "medium",
+      "dependencies": ["scheduler", "device presence"],
+      "api_requirements": ["delivery status", "quiet hours"],
+      "privacy_implications": ["message previews"],
+      "cost": "low to medium",
+      "permissions": ["per-channel consent", "quiet hours"],
+      "testing": ["deduplication", "offline device", "rate limiting"]
+    },
+    {
+      "capability": "telephony and call lifecycle",
+      "complexity": "critical",
+      "dependencies": ["telephony provider", "consent policy", "notification layer"],
+      "api_requirements": ["call state webhooks", "recording controls", "audit log"],
+      "privacy_implications": ["phone numbers", "recording and consent"],
+      "cost": "high",
+      "permissions": ["never automatic", "per-call confirmation"],
+      "testing": ["webhook authentication", "hangup recovery", "duplicate callbacks"]
+    },
+    {
+      "capability": "conversation continuity",
+      "complexity": "high",
+      "dependencies": ["memory", "privacy policy", "session identity"],
+      "api_requirements": ["session resume", "forget/export"],
+      "privacy_implications": ["long-lived conversation history"],
+      "cost": "medium",
+      "permissions": ["retention controls"],
+      "testing": ["redaction", "cross-device resume", "deletion"]
+    }
+  ],
+  "next_milestone": "Design the proactive scheduler contract behind explicit notification consent."
+}

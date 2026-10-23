@@ -46,12 +46,16 @@ class AutonomousEngine:
         context: Optional[Dict[str, Any]] = None,
         logger=print,
         max_steps: int = 20,
+        engineering_director: Any = None,
+        capability_builder: Any = None,
     ):
 
         self.action_registry = action_registry
         self.context = context or {}
         self.logger = logger
         self.max_steps = max_steps
+        self.engineering_director = engineering_director
+        self.capability_builder = capability_builder
 
         self.permissions = PermissionManager()
         self.learning = LearningMemory()
@@ -59,6 +63,81 @@ class AutonomousEngine:
         self.execution_history: List[
             TaskResult
         ] = []
+
+    # --------------------------------------------------------------
+    # Controlled self-engineering integration
+    # --------------------------------------------------------------
+
+    ENGINEERING_MARKERS = (
+        "improve planner",
+        "improve the planner",
+        "improve the code",
+        "refactor ",
+        "fix the planner",
+        "fix planner",
+        "modify source",
+        "add a capability",
+        "add capability",
+        "implement a feature",
+        "change the code",
+        "self-engineering",
+    )
+
+    def attach_engineering_director(self, director: Any) -> None:
+        """Attach the opt-in engineering coordinator to the existing engine."""
+        self.engineering_director = director
+
+    @classmethod
+    def is_engineering_goal(cls, goal: str) -> bool:
+        normalized = " ".join(str(goal or "").lower().split())
+        return any(marker in normalized for marker in cls.ENGINEERING_MARKERS)
+
+    def submit_engineering_goal(self, goal: str, **kwargs: Any) -> Any:
+        """Route an engineering goal through the same autonomous lifecycle.
+
+        The director remains opt-in and owns all policy, sandbox, and
+        checkpoint decisions. This method never turns provider text into a
+        shell command or grants the normal action registry extra permissions.
+        """
+        if self.engineering_director is None:
+            raise RuntimeError("No self-engineering director is attached.")
+        return self.engineering_director.execute(goal, **kwargs)
+
+    # --------------------------------------------------------------
+    # Controlled local capability analysis
+    # --------------------------------------------------------------
+
+    CAPABILITY_MARKERS = (
+        "capability analysis",
+        "capability roadmap",
+        "capability plan",
+        "capability builder",
+        "missing capabilities",
+        "gap analysis",
+        "what capabilities",
+        "which capabilities",
+        "build a capability",
+    )
+
+    def attach_capability_builder(self, builder: Any) -> None:
+        """Attach the read-only local capability builder to this engine."""
+        self.capability_builder = builder
+
+    @classmethod
+    def is_capability_goal(cls, goal: str) -> bool:
+        normalized = " ".join(str(goal or "").lower().split())
+        return any(marker in normalized for marker in cls.CAPABILITY_MARKERS)
+
+    def analyze_capability_goal(self, goal: str, **kwargs: Any) -> Any:
+        """Route a capability goal to the local capability builder.
+
+        The builder is read-only: it inspects the repository, inventories
+        capabilities, builds the dependency graph and roadmap, and stops at the
+        approval gate. Nothing is implemented by this call.
+        """
+        if self.capability_builder is None:
+            raise RuntimeError("No local capability builder is attached.")
+        return self.capability_builder.analyze(goal, **kwargs)
 
     # --------------------------------------------------------------
     # Integration
@@ -129,6 +208,11 @@ class AutonomousEngine:
                 False,
                 "Parameters must be a dictionary.",
             )
+
+        if task.action == "self_engineering":
+            if not isinstance(task.parameters.get("goal"), str) or not task.parameters["goal"].strip():
+                return False, "Self-engineering tasks require a non-empty goal."
+            return True, ""
 
         if not self.has_action(
             task.action
@@ -221,6 +305,19 @@ class AutonomousEngine:
         # ----------------------------------------------------------
         # Execute existing action
         # ----------------------------------------------------------
+
+        if task.action == "self_engineering":
+            try:
+                engineering_task = self.submit_engineering_goal(task.parameters["goal"])
+                task_result = TaskResult(
+                    success=engineering_task.status not in {"failed", "blocked"},
+                    action=task.action,
+                    result=engineering_task.to_dict(),
+                )
+            except Exception as exc:
+                task_result = TaskResult(success=False, action=task.action, error=f"{type(exc).__name__}: {exc}")
+            self.execution_history.append(task_result)
+            return task_result
 
         self.logger(
             "[Autonomous] Executing: "

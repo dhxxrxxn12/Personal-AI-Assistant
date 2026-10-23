@@ -7,6 +7,7 @@ import { store, selectors, finishedAgo } from "./store.js";
 
 const INTERVALS = {
   tasks: 2500,
+  engineering: 3000,
   devices: 6000,
   status: 4000,
   metrics: 2000,
@@ -146,6 +147,11 @@ export function createController({ voice, onEvent } = {}) {
     applyDerived();
   }
 
+  async function loadEngineeringTasks() {
+    const engineeringTasks = await api.engineeringTasks();
+    store.set({ engineeringTasks });
+  }
+
   async function loadDevices() {
     const payload = await api.devices();
     store.set({ devices: payload.devices || [] });
@@ -271,6 +277,24 @@ export function createController({ voice, onEvent } = {}) {
     }
   }
 
+  async function approveEngineeringTask(taskId) {
+    const result = await api.approveEngineeringTask(taskId);
+    await loadEngineeringTasks();
+    return result;
+  }
+
+  async function cancelEngineeringTask(taskId) {
+    const result = await api.cancelEngineeringTask(taskId);
+    await loadEngineeringTasks();
+    return result;
+  }
+
+  async function rollbackEngineeringTask(taskId) {
+    const result = await api.rollbackEngineeringTask(taskId);
+    await loadEngineeringTasks();
+    return result;
+  }
+
   async function interrupt() {
     const active = selectors.activeTasks(state);
     if (!active.length) {
@@ -305,7 +329,7 @@ export function createController({ voice, onEvent } = {}) {
 
   async function refreshAll() {
     try {
-      await Promise.all([loadTasks(), loadDevices(), loadSystemStatus(), loadMetrics(), loadFiles()]);
+      await Promise.all([loadTasks(), loadEngineeringTasks(), loadDevices(), loadSystemStatus(), loadMetrics(), loadFiles()]);
       store.set({ online: true });
     } catch (error) {
       store.set({ online: false, lastError: error.message });
@@ -316,11 +340,13 @@ export function createController({ voice, onEvent } = {}) {
 
   function start() {
     stoppables.push(every(INTERVALS.tasks, loadTasks));
+    stoppables.push(every(INTERVALS.engineering, loadEngineeringTasks));
     stoppables.push(every(INTERVALS.devices, loadDevices));
     stoppables.push(every(INTERVALS.status, loadSystemStatus));
     stoppables.push(every(INTERVALS.metrics, loadMetrics));
     stoppables.push(every(INTERVALS.activitySafety, pollActivity));
     loadFiles().catch(() => {});
+    loadEngineeringTasks().catch(() => {});
     startActivityStream();
     logLocal("SYS", "Command center HUD connected");
     return stop;
@@ -347,6 +373,9 @@ export function createController({ voice, onEvent } = {}) {
     approvePermission,
     denyPermission,
     cancelTask,
+    approveEngineeringTask,
+    cancelEngineeringTask,
+    rollbackEngineeringTask,
     interrupt,
     uploadFile,
     loadFiles,

@@ -17,6 +17,7 @@ import * as activityPanel from "./panels/activity.js";
 import * as uploadPanel from "./panels/upload.js";
 import * as commandPanel from "./panels/command.js";
 import * as tasksPanel from "./panels/tasks.js";
+import * as engineeringPanel from "./panels/engineering.js";
 import * as permissionsPanel from "./panels/permissions.js";
 import * as systemStatusPanel from "./panels/system-status.js";
 import * as footerPanel from "./panels/footer.js";
@@ -33,6 +34,7 @@ const PANELS = [
   uploadPanel,
   commandPanel,
   tasksPanel,
+  engineeringPanel,
   permissionsPanel,
   systemStatusPanel,
   footerPanel,

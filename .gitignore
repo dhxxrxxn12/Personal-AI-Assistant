@@ -66,10 +66,16 @@ screenshots/
 # Cloud and agent runtime state. Keep personal task history, learned workflows,
 # device identities, activity history, uploads, and result outboxes off Git.
 cloud/tasks.json
+cloud/engineering_tasks.json
 cloud/devices.json
 cloud/activity.json
 automation/learning_memory.json
 automation/engineering_memory.json
+automation/capability_plans.json
+automation/capability_registry.json
 automation/permissions.json
 uploads/
 agent/mac_agent_outbox.json
+
+# Isolated self-engineering worktrees are never production source.
+.jarvis-workspaces/

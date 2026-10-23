@@ -6,7 +6,7 @@ import difflib
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .policies import EngineeringOperation, EngineeringPolicy
 
@@ -28,6 +28,18 @@ class CodeExecutor:
 
     def __init__(self, policy: EngineeringPolicy) -> None:
         self.policy = policy
+        self.operations: list[dict[str, Any]] = []
+
+    def _record(self, operation: str, path: str, *, diff: str = "") -> None:
+        self.operations.append({
+            "operation": operation,
+            "path": path,
+            "diff": diff,
+        })
+
+    def trace(self) -> list[dict[str, Any]]:
+        """Return a copy of the bounded, secret-free operation trace."""
+        return [dict(item) for item in self.operations]
 
     @staticmethod
     def _sha256(value: Optional[str]) -> Optional[str]:
@@ -45,7 +57,9 @@ class CodeExecutor:
             raise IsADirectoryError(str(path))
         if resolved.stat().st_size > self.MAX_FILE_BYTES:
             raise ValueError("Source file exceeds the engineering size limit.")
-        return resolved.read_text(encoding="utf-8")
+        content = resolved.read_text(encoding="utf-8")
+        self._record(EngineeringOperation.READ_SOURCE.value, self.policy.relative_path(resolved))
+        return content
 
     def _diff(self, relative: str, before: Optional[str], after: Optional[str], *, new_path: Optional[str] = None) -> str:
         old_lines = (before or "").splitlines(keepends=True)
@@ -72,13 +86,15 @@ class CodeExecutor:
         diff = self._diff(self.policy.relative_path(resolved), before, content)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
-        return ChangeResult(
+        result = ChangeResult(
             operation=operation.value,
             path=self.policy.relative_path(resolved),
             before_sha256=self._sha256(before),
             after_sha256=self._sha256(content),
             diff=diff,
         )
+        self._record(result.operation, result.path, diff=result.diff)
+        return result
 
     def create_file(self, path: str | Path, content: str, *, approved: bool = False) -> ChangeResult:
         resolved = self._path(path)
@@ -121,13 +137,15 @@ class CodeExecutor:
             before,
             new_path=self.policy.relative_path(destination_path),
         )
-        return ChangeResult(
+        result = ChangeResult(
             operation=EngineeringOperation.RENAME_FILE.value,
             path=self.policy.relative_path(destination_path),
             before_sha256=self._sha256(before),
             after_sha256=self._sha256(before),
             diff=diff,
         )
+        self._record(result.operation, result.path, diff=result.diff)
+        return result
 
     def delete_file(self, path: str | Path, *, approved: bool = False) -> ChangeResult:
         resolved = self._path(path, must_exist=True)
@@ -137,10 +155,12 @@ class CodeExecutor:
         before = resolved.read_text(encoding="utf-8")
         diff = self._diff(self.policy.relative_path(resolved), before, None)
         resolved.unlink()
-        return ChangeResult(
+        result = ChangeResult(
             operation=EngineeringOperation.DELETE_FILE.value,
             path=self.policy.relative_path(resolved),
             before_sha256=self._sha256(before),
             after_sha256=None,
             diff=diff,
         )
+        self._record(result.operation, result.path, diff=result.diff)
+        return result
